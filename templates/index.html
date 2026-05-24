@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>STOCK NEXUS — Intelligence Terminal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;700&family=Bebas+Neue&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="/static/css/style.css"/>
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="logo-ng">EU/AS</span>
+    <span class="logo-div">✦</span>
+    <span class="logo-main">STOCK</span>
+    <span class="logo-nexus">NEXUS</span>
+    <span class="logo-sub">EQUITY INTELLIGENCE TERMINAL</span>
+  </div>
+  <div class="topbar-right">
+    <div class="market-pill ng-pill" id="ngx-status-pill">
+      <span class="pill-dot"></span>
+      <span>EU/AS</span>
+      <span id="hdr-dangcem" class="price-neutral">—</span>
+    </div>
+    <div class="market-pill us-pill" id="us-status-pill">
+      <span class="pill-dot"></span>
+      <span>NASDAQ</span>
+      <span id="hdr-nvda" class="price-neutral">—</span>
+    </div>
+    <div class="divider-v"></div>
+    <span id="ws-status" class="ws-badge connecting"><span class="ws-dot"></span> CONNECTING</span>
+    <span id="clock" class="clock">—</span>
+  </div>
+</div>
+
+<!-- MAIN LAYOUT -->
+<div class="main-layout">
+
+  <!-- SIDEBAR -->
+  <nav class="sidebar">
+    <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⬛</span><span>DASH</span></button>
+    <button class="nav-item" data-page="ngx"><span class="nav-icon">🌍</span><span>EU/AS</span></button>
+    <button class="nav-item" data-page="us"><span class="nav-icon">🇺🇸</span><span>NYSE</span></button>
+    <button class="nav-item" data-page="predictor"><span class="nav-icon">✦</span><span>SIGNAL</span></button>
+    <button class="nav-item" data-page="scanner"><span class="nav-icon">⚡</span><span>SCAN</span></button>
+    <button class="nav-item" data-page="chartai"><span class="nav-icon">👁</span><span>VISION</span></button>
+    <button class="nav-item" data-page="journal"><span class="nav-icon">◉</span><span>TRADE</span></button>
+  </nav>
+
+  <!-- PAGE CONTAINER -->
+  <div class="page-wrap">
+
+    <!-- ══════════════════ DASHBOARD ══════════════════ -->
+    <div id="page-dashboard" class="page active">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Market Overview</h1>
+          <div class="page-sub">GLOBAL EQUITY INTELLIGENCE</div>
+        </div>
+        <span id="dash-ws" class="ws-badge connecting"><span class="ws-dot"></span> CONNECTING</span>
+      </div>
+      <div class="kpi-grid" id="kpi-grid"></div>
+      <div class="two-col" style="margin-top:20px">
+        <div class="card">
+          <div class="section-title ngx-label">🌍 EU/ASIA — TOP MOVERS</div>
+          <div id="dash-ng-movers"></div>
+        </div>
+        <div class="card">
+          <div class="section-title us-label">🇺🇸 US — TOP MOVERS</div>
+          <div id="dash-us-movers"></div>
+        </div>
+      </div>
+      <div class="two-col" style="margin-top:16px">
+        <div class="card">
+          <div class="section-title gain-title">▲ TODAY'S LEADERS</div>
+          <div id="dash-leaders"></div>
+        </div>
+        <div class="card">
+          <div class="section-title loss-title">▼ TODAY'S LAGGARDS</div>
+          <div id="dash-laggards"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="section-title">SECTOR HEATMAP — ALL STOCKS</div>
+        <div class="heatmap" id="heatmap"></div>
+      </div>
+    </div>
+
+    <!-- ══════════════════ EU/ASIA PAGE ══════════════════ -->
+    <div id="page-ngx" class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title" style="color:var(--ng-green)">European &amp; Asian Markets</h1>
+          <div class="page-sub">EU &amp; ASIA — 49 LISTED STOCKS · LIVE PRICES</div>
+        </div>
+        <div class="cat-filters" id="ngx-sector-filters"></div>
+      </div>
+      <div class="card">
+        <div class="markets-header table-row">
+          <div>#</div><div>STOCK</div><div>PRICE</div>
+          <div>CHANGE %</div><div>HIGH/LOW</div><div>VOLUME</div>
+          <div>SECTOR</div><div>SIGNAL</div>
+        </div>
+        <div id="ngx-list"></div>
+      </div>
+    </div>
+
+    <!-- ══════════════════ US PAGE ══════════════════ -->
+    <div id="page-us" class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title" style="color:var(--us-blue)">US Markets</h1>
+          <div class="page-sub">NYSE / NASDAQ — 76 STOCKS & ETFs · LIVE PRICES ($)</div>
+        </div>
+        <div class="cat-filters" id="us-sector-filters"></div>
+      </div>
+      <div class="card">
+        <div class="markets-header table-row">
+          <div>#</div><div>STOCK</div><div>PRICE ($)</div>
+          <div>CHANGE %</div><div>MARKET CAP</div><div>VOLUME</div>
+          <div>SECTOR</div><div>SIGNAL</div>
+        </div>
+        <div id="us-list"></div>
+      </div>
+    </div>
+
+    <!-- ══════════════════ PREDICTOR ══════════════════ -->
+    <div id="page-predictor" class="page predictor-layout">
+      <div class="pred-sidebar">
+        <div class="pred-mkt-toggle">
+          <button class="mkt-btn active" data-mkt="eu" onclick="setPredMarket('eu')">🌍 EU</button>
+          <button class="mkt-btn" data-mkt="as" onclick="setPredMarket('as')">🌏 ASIA</button>
+          <button class="mkt-btn" data-mkt="us" onclick="setPredMarket('us')">🇺🇸 US</button>
+        </div>
+        <div class="coin-search-wrap">
+          <span class="coin-search-icon">⌕</span>
+          <input class="coin-search" id="stock-search" placeholder="Search stocks..." oninput="filterPredStocks(this.value)"/>
+        </div>
+        <div class="pred-coinlist" id="pred-stocklist"></div>
+      </div>
+      <div class="pred-main">
+        <div class="pred-sticky-bar" id="pred-sticky-bar">
+          <div class="pred-header" id="pred-header">
+            <div class="empty-pred-header">SELECT A STOCK TO ANALYZE</div>
+          </div>
+          <div class="pred-analyze-bar">
+            <div class="trade-size-wrap">
+              <span class="trade-size-label">BALANCE</span>
+              <input type="number" id="pred-balance" class="trade-size-input" placeholder="100000" min="1" step="1000"/>
+            </div>
+            <div class="trade-size-wrap">
+              <span class="trade-size-label">RISK %</span>
+              <input type="number" id="pred-risk-pct" class="trade-size-input" placeholder="1" min="0.1" max="20" step="0.1" style="width:60px"/>
+            </div>
+            <button class="btn-primary" id="analyze-btn">ANALYZE STOCK</button>
+          </div>
+        </div>
+        <div class="pred-content" id="pred-content">
+          <div class="empty-state">
+            <div class="empty-title">STOCK NEXUS</div>
+            <div class="empty-sub">SELECT A STOCK AND CLICK ANALYZE<br/>FOR AI-POWERED EQUITY PREDICTIONS</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════════ SCANNER ══════════════════ -->
+    <div id="page-scanner" class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Signal Scanner</h1>
+          <div class="page-sub">FULL TECHNICAL SCAN · ALL EU, ASIAN &amp; US STOCKS</div>
+        </div>
+        <div style="display:flex;gap:10px">
+          <div class="cat-filters">
+            <button class="cat-btn active" data-mkt="both" onclick="setScanMarket('both',this)">ALL</button>
+            <button class="cat-btn" data-mkt="eu" onclick="setScanMarket('eu',this)">🌍 EU</button>
+            <button class="cat-btn" data-mkt="as" onclick="setScanMarket('as',this)">🌏 ASIA</button>
+            <button class="cat-btn" data-mkt="us" onclick="setScanMarket('us',this)">🇺🇸 US</button>
+          </div>
+          <button class="btn-primary" id="scan-btn">⚡ RUN SCAN</button>
+        </div>
+      </div>
+      <div id="scanner-content">
+        <div class="empty-state">
+          <div class="empty-title" style="font-size:36px">⚡</div>
+          <div class="empty-sub">RUN SCAN TO SURFACE HIGH-CONFIDENCE SETUPS<br/>ACROSS ALL EU, ASIAN &amp; US STOCKS</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════════ CHART AI / VISION ══════════════════ -->
+    <div id="page-chartai" class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Chart Vision AI</h1>
+          <div class="page-sub">UPLOAD A CHART · GET INSTANT AI TECHNICAL ANALYSIS</div>
+        </div>
+      </div>
+      <div class="chartai-layout">
+        <div class="chartai-upload-panel card">
+          <div class="section-title">📤 UPLOAD CHART</div>
+          <div class="upload-zone" id="upload-zone" onclick="document.getElementById('chart-file-input').click()">
+            <div class="upload-icon">👁</div>
+            <div class="upload-title">DROP CHART IMAGE HERE</div>
+            <div class="upload-sub">PNG · JPG · WEBP · Any timeframe · Any asset</div>
+            <input type="file" id="chart-file-input" accept="image/*" style="display:none" onchange="handleChartUpload(this)"/>
+          </div>
+          <div id="chart-preview-wrap" style="display:none">
+            <img id="chart-preview" class="chart-preview-img" alt="Chart preview"/>
+            <button class="btn-secondary" onclick="clearChartUpload()">✕ Clear</button>
+          </div>
+          <div style="margin-top:16px">
+            <div class="trade-size-label" style="margin-bottom:6px">STOCK / ASSET CONTEXT (optional)</div>
+            <input type="text" id="chart-context-input" class="coin-search" style="width:100%;box-sizing:border-box"
+                   placeholder="e.g. ASML EU daily chart, AAPL 4H..."/>
+          </div>
+          <button class="btn-primary" id="chart-analyze-btn" style="width:100%;margin-top:14px" onclick="runChartAnalysis()">
+            👁 ANALYZE CHART WITH AI
+          </button>
+          <div id="chart-analyze-status" class="chart-status"></div>
+        </div>
+        <div class="chartai-result-panel card" id="chartai-result-panel">
+          <div class="empty-state" id="chartai-empty">
+            <div class="empty-title" style="font-size:40px">👁</div>
+            <div class="empty-sub">UPLOAD A CHART AND CLICK ANALYZE<br/>AI WILL READ PRICE ACTION, PATTERNS,<br/>INDICATORS & GIVE TRADE SETUPS</div>
+          </div>
+          <div id="chartai-result" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════════════ TRADE JOURNAL ══════════════════ -->
+    <div id="page-journal" class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Trade Journal</h1>
+          <div class="page-sub">GLOBAL EQUITY POSITIONS · P&amp;L TRACKER</div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn-secondary" id="add-trade-btn">+ ADD TRADE</button>
+          <button class="btn-secondary" id="export-csv-btn">⬇ EXPORT CSV</button>
+        </div>
+      </div>
+      <div class="card hidden" id="add-trade-form">
+        <div class="section-title">NEW POSITION</div>
+        <div class="add-trade-grid">
+          <div class="field-group">
+            <label>MARKET</label>
+            <select id="jnl-market" class="trade-size-input">
+              <option value="eu">🌍 EU</option>
+              <option value="as">🌏 ASIA</option>
+              <option value="us">🇺🇸 US</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label>STOCK</label>
+            <input type="text" id="jnl-stock" class="trade-size-input" placeholder="e.g. ASML"/>
+          </div>
+          <div class="field-group">
+            <label>DIRECTION</label>
+            <select id="jnl-dir" class="trade-size-input">
+              <option value="LONG">LONG</option>
+              <option value="SHORT">SHORT</option>
+            </select>
+          </div>
+          <div class="field-group">
+            <label>ENTRY PRICE</label>
+            <input type="number" id="jnl-entry" class="trade-size-input" placeholder="0.00" step="0.01"/>
+          </div>
+          <div class="field-group">
+            <label>QUANTITY</label>
+            <input type="number" id="jnl-qty" class="trade-size-input" placeholder="100" step="1"/>
+          </div>
+          <div class="field-group">
+            <label>STOP LOSS</label>
+            <input type="number" id="jnl-stop" class="trade-size-input" placeholder="0.00" step="0.01"/>
+          </div>
+          <div class="field-group">
+            <label>TP1</label>
+            <input type="number" id="jnl-tp1" class="trade-size-input" placeholder="0.00" step="0.01"/>
+          </div>
+          <div class="field-group">
+            <label>TP2</label>
+            <input type="number" id="jnl-tp2" class="trade-size-input" placeholder="0.00" step="0.01"/>
+          </div>
+          <div class="field-group">
+            <label>NOTES</label>
+            <input type="text" id="jnl-notes" class="trade-size-input" placeholder="Setup notes..."/>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button class="btn-primary" onclick="addJournalTrade()">ADD POSITION</button>
+          <button class="btn-secondary" onclick="document.getElementById('add-trade-form').classList.add('hidden')">CANCEL</button>
+        </div>
+      </div>
+      <div class="card" id="journal-stats"></div>
+      <div class="card" style="margin-top:16px">
+        <div class="section-title">OPEN POSITIONS</div>
+        <div id="journal-open"></div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="section-title">CLOSED TRADES</div>
+        <div id="journal-closed"></div>
+      </div>
+    </div>
+
+  </div><!-- /.page-wrap -->
+</div><!-- /.main-layout -->
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
