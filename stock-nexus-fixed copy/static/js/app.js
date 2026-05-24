@@ -1,1367 +1,1185 @@
-"""
-STOCK NEXUS — Global & US Stock Intelligence Terminal
-======================================================
-Mirrors the Forex Nexus architecture but built for:
-  - European stocks (LSE, Euronext, XETRA, SIX, etc.)
-  - Asian stocks (TSE, HKEX, NSE, KRX, plus US-listed ADRs)
-  - US stocks (NYSE / NASDAQ)
-  - Chart image analysis via local retrieval model (no external API needed)
-"""
+// ═══════════════════════════════════════════════════════════
+//  STOCK NEXUS — app.js
+// ═══════════════════════════════════════════════════════════
 
-# ── Async server monkey-patch — MUST be first, before all other imports ───────
-# gevent/eventlet must patch here at module load time. Patching inside
-# if __name__ == "__main__" is too late (Flask/requests already imported)
-# and causes "Cannot switch to different thread" / recursion errors on macOS.
-_ASYNC_SERVER = None
-try:
-    import gevent.monkey as _gm
-    _gm.patch_all()
-    _ASYNC_SERVER = "gevent"
-except ImportError:
-    try:
-        # Force eventlet to use 'poll' hub — kqueue hub is broken on macOS/Python 3.9
-        import os as _os
-        _os.environ.setdefault("EVENTLET_HUB", "poll")
-        import eventlet as _ev
-        _ev.monkey_patch()
-        _ASYNC_SERVER = "eventlet"
-    except ImportError:
-        _ASYNC_SERVER = "werkzeug"
+let euStocks = [], asiaStocks = [], usStocks = [];
+let marketEu = {}, marketAs = {}, marketUs = {};
+let currentPage = "dashboard";
+let sseSource = null;
+let selectedStock = null;
+let predMarket = "eu";
+let scanMarket = "both";
+let euSectorFilter = "ALL";
+let usSectorFilter = "ALL";
+const CURR_SYMS = {"USD":"$","EUR":"€","GBP":"p","JPY":"¥","HKD":"HK$","INR":"₹","KRW":"₩","CHF":"Fr","DKK":"kr","SEK":"kr","NGN":"₦"};
+let trades = JSON.parse(localStorage.getItem("sn_trades") || "[]");
 
-import json, os, queue, random, threading, time, base64, sys
-import requests
-from flask import Flask, Response, render_template, jsonify, request, stream_with_context
-from flask_cors import CORS
-import numpy as np
-import pandas as pd
-
-# ── Load .env file if present (must be before any os.environ.get calls) ───────
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # python-dotenv optional — env vars still work via OS / Render dashboard
-
-# ── Persistent storage (optional — graceful fallback) ─────────────────────────
-_db_ok = False
-def _db_connected(): return False
-
-# ── Local retrieval model ─────────────────────────────────────────────────────
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "model"))
-try:
-    from retrieval import retrieve_top, db_ready, db_stats
-    _retrieval_ok = True
-except ImportError:
-    _retrieval_ok = False
-
-try:
-    from predictor import predict as ml_predict, predictor_status, models_ready
-    _predictor_ok = True
-except ImportError:
-    _predictor_ok = False
-    def ml_predict(df, price): return {"ml_signal": "UNAVAILABLE", "ml_source": "unavailable", "ml_confidence": 0, "ml_direction": None, "ml_prob_up": None, "ml_change_pct": None, "ml_target_low": None, "ml_target_mid": None, "ml_target_high": None}
-    def predictor_status(): return {"xgboost_ready": False, "lstm_ready": False}
-    def models_ready(): return False
-
-app = Flask(__name__)
-CORS(app)
-
-# ── Numpy JSON serialiser ─────────────────────────────────────────────────────
-def _sanitize(obj):
-    if isinstance(obj, dict):   return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)): return [_sanitize(v) for v in obj]
-    if isinstance(obj, np.bool_):    return bool(obj)
-    if isinstance(obj, np.integer):  return int(obj)
-    if isinstance(obj, np.floating): return float(obj)
-    if isinstance(obj, np.ndarray):  return obj.tolist()
-    return obj
-
-try:
-    import yfinance as yf
-    _yf_ok = True
-except ImportError:
-    _yf_ok = False
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STOCK UNIVERSE
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Currency symbol map ───────────────────────────────────────────────────────
-CURR_SYMBOLS = {
-    "USD": "$", "EUR": "€", "GBP": "p", "JPY": "¥",
-    "HKD": "HK$", "INR": "₹", "KRW": "₩", "CHF": "Fr",
-    "DKK": "kr", "SEK": "kr",
+// ── FORMAT HELPERS ─────────────────────────────────────────────
+function fp(v, currency = "USD") {
+  if (v == null || isNaN(v)) return "—";
+  const sym = CURR_SYMS[currency] || "$";
+  if (v >= 1e12) return sym + (v/1e12).toFixed(2) + "T";
+  if (v >= 1e9)  return sym + (v/1e9).toFixed(2) + "B";
+  if (v >= 1e6)  return sym + (v/1e6).toFixed(2) + "M";
+  if (v >= 1000) return sym + v.toLocaleString("en", {minimumFractionDigits:2,maximumFractionDigits:2});
+  return sym + v.toFixed(2);
+}
+function currSym(currency) { return CURR_SYMS[currency] || "$"; }
+function fpRaw(v) {
+  if (v == null || isNaN(v)) return "—";
+  if (v >= 1000) return v.toLocaleString("en", {minimumFractionDigits:2,maximumFractionDigits:2});
+  return v.toFixed(2);
+}
+function fPct(v) { return (v >= 0 ? "+" : "") + v.toFixed(2) + "%"; }
+function chColor(v) { return v > 0 ? "var(--green)" : v < 0 ? "var(--red)" : "var(--text3)"; }
+function chClass(v) { return v > 0 ? "price-up" : v < 0 ? "price-down" : "price-neutral"; }
+function dirColor(d) { return d==="BULLISH"?"var(--green)":d==="BEARISH"?"var(--red)":"var(--amber)"; }
+function sigBadge(dir, conf) {
+  const cls = dir==="BULLISH"?"sig-bull":dir==="BEARISH"?"sig-bear":"sig-neut";
+  return `<span class="sig-badge ${cls}">${dir} ${conf?conf+'%':''}</span>`;
+}
+function quickSignal(change) {
+  if (change > 2) return sigBadge("BULLISH", "");
+  if (change < -2) return sigBadge("BEARISH", "");
+  return sigBadge("NEUTRAL", "");
 }
 
-EU_STOCKS = [
-    # UK
-    {"id":"SHEL.L",    "name":"Shell Plc",             "sector":"Energy",     "currency":"GBP","yf":"SHEL.L",    "color":"#34D399"},
-    {"id":"BP.L",      "name":"BP Plc",                "sector":"Energy",     "currency":"GBP","yf":"BP.L",      "color":"#22C55E"},
-    {"id":"AZN.L",     "name":"AstraZeneca Plc",       "sector":"Healthcare", "currency":"GBP","yf":"AZN.L",     "color":"#E63946"},
-    {"id":"HSBA.L",    "name":"HSBC Holdings Plc",     "sector":"Finance",    "currency":"GBP","yf":"HSBA.L",    "color":"#4A9EFF"},
-    {"id":"ULVR.L",    "name":"Unilever Plc",          "sector":"Consumer",   "currency":"GBP","yf":"ULVR.L",    "color":"#F472B6"},
-    {"id":"GSK.L",     "name":"GSK Plc",               "sector":"Healthcare", "currency":"GBP","yf":"GSK.L",     "color":"#FB923C"},
-    {"id":"RIO.L",     "name":"Rio Tinto Plc",         "sector":"Materials",  "currency":"GBP","yf":"RIO.L",     "color":"#FF6B4A"},
-    # France
-    {"id":"MC.PA",     "name":"LVMH",                  "sector":"Luxury",     "currency":"EUR","yf":"MC.PA",     "color":"#FFD700"},
-    {"id":"OR.PA",     "name":"L'Oreal SA",            "sector":"Consumer",   "currency":"EUR","yf":"OR.PA",     "color":"#F472B6"},
-    {"id":"TTE.PA",    "name":"TotalEnergies SE",      "sector":"Energy",     "currency":"EUR","yf":"TTE.PA",    "color":"#34D399"},
-    {"id":"AIR.PA",    "name":"Airbus SE",             "sector":"Industrial", "currency":"EUR","yf":"AIR.PA",    "color":"#FB923C"},
-    {"id":"BNP.PA",    "name":"BNP Paribas SA",        "sector":"Finance",    "currency":"EUR","yf":"BNP.PA",    "color":"#4A9EFF"},
-    {"id":"RMS.PA",    "name":"Hermes International",  "sector":"Luxury",     "currency":"EUR","yf":"RMS.PA",    "color":"#C084FC"},
-    {"id":"SAN.PA",    "name":"Sanofi SA",             "sector":"Healthcare", "currency":"EUR","yf":"SAN.PA",    "color":"#E63946"},
-    # Germany
-    {"id":"SAP.DE",    "name":"SAP SE",                "sector":"Technology", "currency":"EUR","yf":"SAP.DE",    "color":"#38BDF8"},
-    {"id":"SIE.DE",    "name":"Siemens AG",            "sector":"Industrial", "currency":"EUR","yf":"SIE.DE",    "color":"#60A5FA"},
-    {"id":"BMW.DE",    "name":"BMW AG",                "sector":"Auto",       "currency":"EUR","yf":"BMW.DE",    "color":"#A78BFA"},
-    {"id":"MBG.DE",    "name":"Mercedes-Benz Group",   "sector":"Auto",       "currency":"EUR","yf":"MBG.DE",    "color":"#7C3AED"},
-    {"id":"VOW3.DE",   "name":"Volkswagen AG",         "sector":"Auto",       "currency":"EUR","yf":"VOW3.DE",   "color":"#0071C5"},
-    {"id":"ALV.DE",    "name":"Allianz SE",            "sector":"Finance",    "currency":"EUR","yf":"ALV.DE",    "color":"#38BDF8"},
-    {"id":"ADS.DE",    "name":"Adidas AG",             "sector":"Consumer",   "currency":"EUR","yf":"ADS.DE",    "color":"#1A1A1A"},
-    {"id":"DTE.DE",    "name":"Deutsche Telekom AG",   "sector":"Telecom",    "currency":"EUR","yf":"DTE.DE",    "color":"#E2007A"},
-    # Switzerland
-    {"id":"NESN.SW",   "name":"Nestle SA",             "sector":"Consumer",   "currency":"CHF","yf":"NESN.SW",   "color":"#F472B6"},
-    {"id":"ROG.SW",    "name":"Roche Holding AG",      "sector":"Healthcare", "currency":"CHF","yf":"ROG.SW",    "color":"#E63946"},
-    {"id":"NOVN.SW",   "name":"Novartis AG",           "sector":"Healthcare", "currency":"CHF","yf":"NOVN.SW",   "color":"#FB923C"},
-    # Netherlands
-    {"id":"ASML.AS",   "name":"ASML Holding NV",       "sector":"Technology", "currency":"EUR","yf":"ASML.AS",   "color":"#00A3E0"},
-    # Denmark
-    {"id":"NOVO-B.CO", "name":"Novo Nordisk A/S",      "sector":"Healthcare", "currency":"DKK","yf":"NOVO-B.CO", "color":"#E11B22"},
-    # Italy
-    {"id":"RACE.MI",   "name":"Ferrari NV",            "sector":"Auto",       "currency":"EUR","yf":"RACE.MI",   "color":"#CC0000"},
-    {"id":"ENI.MI",    "name":"Eni SpA",               "sector":"Energy",     "currency":"EUR","yf":"ENI.MI",    "color":"#FFD700"},
-]
-
-ASIA_STOCKS = [
-    # Japan
-    {"id":"7203.T",    "name":"Toyota Motor Corp",     "sector":"Auto",       "currency":"JPY","yf":"7203.T",    "color":"#CC0000"},
-    {"id":"6758.T",    "name":"Sony Group Corp",       "sector":"Technology", "currency":"JPY","yf":"6758.T",    "color":"#000000"},
-    {"id":"9984.T",    "name":"SoftBank Group Corp",   "sector":"Technology", "currency":"JPY","yf":"9984.T",    "color":"#FF6B00"},
-    {"id":"7974.T",    "name":"Nintendo Co Ltd",       "sector":"Gaming",     "currency":"JPY","yf":"7974.T",    "color":"#E4000F"},
-    {"id":"6501.T",    "name":"Hitachi Ltd",           "sector":"Industrial", "currency":"JPY","yf":"6501.T",    "color":"#CF0A2C"},
-    {"id":"8306.T",    "name":"Mitsubishi UFJ Fin.",   "sector":"Finance",    "currency":"JPY","yf":"8306.T",    "color":"#4A9EFF"},
-    # Hong Kong / China
-    {"id":"0700.HK",   "name":"Tencent Holdings",      "sector":"Technology", "currency":"HKD","yf":"0700.HK",   "color":"#38BDF8"},
-    {"id":"9988.HK",   "name":"Alibaba Group (HK)",    "sector":"eCommerce",  "currency":"HKD","yf":"9988.HK",   "color":"#FF6A00"},
-    {"id":"3690.HK",   "name":"Meituan",               "sector":"eCommerce",  "currency":"HKD","yf":"3690.HK",   "color":"#FFD700"},
-    {"id":"9618.HK",   "name":"JD.com Inc (HK)",       "sector":"eCommerce",  "currency":"HKD","yf":"9618.HK",   "color":"#CC0000"},
-    {"id":"2318.HK",   "name":"Ping An Insurance",     "sector":"Finance",    "currency":"HKD","yf":"2318.HK",   "color":"#E63946"},
-    # India
-    {"id":"RELIANCE.NS","name":"Reliance Industries",  "sector":"Conglomerate","currency":"INR","yf":"RELIANCE.NS","color":"#1D4ED8"},
-    {"id":"HDFCBANK.NS","name":"HDFC Bank Ltd",        "sector":"Finance",    "currency":"INR","yf":"HDFCBANK.NS","color":"#004C8F"},
-    {"id":"TCS.NS",    "name":"Tata Consultancy Svcs", "sector":"Technology", "currency":"INR","yf":"TCS.NS",    "color":"#4A9EFF"},
-    {"id":"INFY.NS",   "name":"Infosys Ltd",           "sector":"Technology", "currency":"INR","yf":"INFY.NS",   "color":"#007CC3"},
-    {"id":"ICICIBANK.NS","name":"ICICI Bank Ltd",      "sector":"Finance",    "currency":"INR","yf":"ICICIBANK.NS","color":"#F97316"},
-    # South Korea
-    {"id":"005930.KS", "name":"Samsung Electronics",   "sector":"Technology", "currency":"KRW","yf":"005930.KS", "color":"#1428A0"},
-    # Taiwan / SE Asia (US-listed ADRs — most reliable via yfinance)
-    {"id":"TSM",       "name":"TSMC (Taiwan Semi)",    "sector":"Technology", "currency":"USD","yf":"TSM",       "color":"#0070AD"},
-    {"id":"SE",        "name":"Sea Limited",           "sector":"Technology", "currency":"USD","yf":"SE",        "color":"#EE3024"},
-    {"id":"GRAB",      "name":"Grab Holdings",         "sector":"Transport",  "currency":"USD","yf":"GRAB",      "color":"#00B14F"},
-]
-
-US_STOCKS = [
-    # ── Mega-cap Technology ───────────────────────────────────────────────────
-    {"id":"AAPL",  "name":"Apple Inc",             "sector":"Technology",    "currency":"USD","yf":"AAPL",  "color":"#4A9EFF"},
-    {"id":"MSFT",  "name":"Microsoft Corp",         "sector":"Technology",    "currency":"USD","yf":"MSFT",  "color":"#00D4AA"},
-    {"id":"NVDA",  "name":"NVIDIA Corp",             "sector":"Technology",    "currency":"USD","yf":"NVDA",  "color":"#76C442"},
-    {"id":"GOOGL", "name":"Alphabet Inc",            "sector":"Technology",    "currency":"USD","yf":"GOOGL", "color":"#FF6B4A"},
-    {"id":"META",  "name":"Meta Platforms",          "sector":"Technology",    "currency":"USD","yf":"META",  "color":"#4267B2"},
-    # ── Technology ────────────────────────────────────────────────────────────
-    {"id":"AMD",   "name":"Advanced Micro Devices",  "sector":"Technology",    "currency":"USD","yf":"AMD",   "color":"#ED1C24"},
-    {"id":"INTC",  "name":"Intel Corp",              "sector":"Technology",    "currency":"USD","yf":"INTC",  "color":"#0071C5"},
-    {"id":"AVGO",  "name":"Broadcom Inc",            "sector":"Technology",    "currency":"USD","yf":"AVGO",  "color":"#CF0A2C"},
-    {"id":"QCOM",  "name":"Qualcomm Inc",            "sector":"Technology",    "currency":"USD","yf":"QCOM",  "color":"#3253DC"},
-    {"id":"CRM",   "name":"Salesforce Inc",          "sector":"Technology",    "currency":"USD","yf":"CRM",   "color":"#00A1E0"},
-    {"id":"ORCL",  "name":"Oracle Corp",             "sector":"Technology",    "currency":"USD","yf":"ORCL",  "color":"#F80000"},
-    {"id":"ADBE",  "name":"Adobe Inc",               "sector":"Technology",    "currency":"USD","yf":"ADBE",  "color":"#FF0000"},
-    {"id":"IBM",   "name":"IBM Corp",                "sector":"Technology",    "currency":"USD","yf":"IBM",   "color":"#1F70C1"},
-    {"id":"UBER",  "name":"Uber Technologies",       "sector":"Technology",    "currency":"USD","yf":"UBER",  "color":"#000000"},
-    {"id":"PLTR",  "name":"Palantir Technologies",   "sector":"Technology",    "currency":"USD","yf":"PLTR",  "color":"#8B5CF6"},
-    {"id":"SNOW",  "name":"Snowflake Inc",           "sector":"Technology",    "currency":"USD","yf":"SNOW",  "color":"#29B5E8"},
-    {"id":"NFLX",  "name":"Netflix Inc",             "sector":"Media",         "currency":"USD","yf":"NFLX",  "color":"#E50914"},
-    # ── Consumer (Discretionary & Staples) ───────────────────────────────────
-    {"id":"AMZN",  "name":"Amazon.com Inc",          "sector":"Consumer",      "currency":"USD","yf":"AMZN",  "color":"#FFB84A"},
-    {"id":"TSLA",  "name":"Tesla Inc",               "sector":"EV/Auto",       "currency":"USD","yf":"TSLA",  "color":"#CC0000"},
-    {"id":"WMT",   "name":"Walmart Inc",             "sector":"Consumer",      "currency":"USD","yf":"WMT",   "color":"#FCD34D"},
-    {"id":"DIS",   "name":"Walt Disney Co",          "sector":"Media",         "currency":"USD","yf":"DIS",   "color":"#0072CE"},
-    {"id":"NKE",   "name":"Nike Inc",                "sector":"Consumer",      "currency":"USD","yf":"NKE",   "color":"#F05A28"},
-    {"id":"MCD",   "name":"McDonald's Corp",         "sector":"Consumer",      "currency":"USD","yf":"MCD",   "color":"#FFC72C"},
-    {"id":"SBUX",  "name":"Starbucks Corp",          "sector":"Consumer",      "currency":"USD","yf":"SBUX",  "color":"#00704A"},
-    {"id":"HD",    "name":"Home Depot Inc",          "sector":"Consumer",      "currency":"USD","yf":"HD",    "color":"#F96302"},
-    {"id":"COST",  "name":"Costco Wholesale",        "sector":"Consumer",      "currency":"USD","yf":"COST",  "color":"#005DAA"},
-    {"id":"CMG",   "name":"Chipotle Mexican Grill",  "sector":"Consumer",      "currency":"USD","yf":"CMG",   "color":"#A81612"},
-    {"id":"GM",    "name":"General Motors Co",       "sector":"EV/Auto",       "currency":"USD","yf":"GM",    "color":"#0170CE"},
-    {"id":"F",     "name":"Ford Motor Co",           "sector":"EV/Auto",       "currency":"USD","yf":"F",     "color":"#003478"},
-    # ── Finance ───────────────────────────────────────────────────────────────
-    {"id":"BRK-B", "name":"Berkshire Hathaway B",    "sector":"Finance",       "currency":"USD","yf":"BRK-B", "color":"#C084FC"},
-    {"id":"JPM",   "name":"JPMorgan Chase",          "sector":"Finance",       "currency":"USD","yf":"JPM",   "color":"#38BDF8"},
-    {"id":"V",     "name":"Visa Inc",                "sector":"Finance",       "currency":"USD","yf":"V",     "color":"#1A56DB"},
-    {"id":"MA",    "name":"Mastercard Inc",          "sector":"Finance",       "currency":"USD","yf":"MA",    "color":"#EB001B"},
-    {"id":"BAC",   "name":"Bank of America",         "sector":"Finance",       "currency":"USD","yf":"BAC",   "color":"#E31837"},
-    {"id":"GS",    "name":"Goldman Sachs Group",     "sector":"Finance",       "currency":"USD","yf":"GS",    "color":"#7399C6"},
-    {"id":"MS",    "name":"Morgan Stanley",          "sector":"Finance",       "currency":"USD","yf":"MS",    "color":"#215091"},
-    {"id":"WFC",   "name":"Wells Fargo & Co",        "sector":"Finance",       "currency":"USD","yf":"WFC",   "color":"#D71E28"},
-    {"id":"C",     "name":"Citigroup Inc",           "sector":"Finance",       "currency":"USD","yf":"C",     "color":"#003B70"},
-    {"id":"AXP",   "name":"American Express Co",     "sector":"Finance",       "currency":"USD","yf":"AXP",   "color":"#007BC1"},
-    {"id":"PYPL",  "name":"PayPal Holdings",         "sector":"Finance",       "currency":"USD","yf":"PYPL",  "color":"#003087"},
-    {"id":"SCHW",  "name":"Charles Schwab Corp",     "sector":"Finance",       "currency":"USD","yf":"SCHW",  "color":"#00A0DF"},
-    {"id":"COIN",  "name":"Coinbase Global",         "sector":"Crypto/Finance","currency":"USD","yf":"COIN",  "color":"#1652F0"},
-    # ── Healthcare ────────────────────────────────────────────────────────────
-    {"id":"JNJ",   "name":"Johnson & Johnson",       "sector":"Healthcare",    "currency":"USD","yf":"JNJ",   "color":"#E63946"},
-    {"id":"UNH",   "name":"UnitedHealth Group",      "sector":"Healthcare",    "currency":"USD","yf":"UNH",   "color":"#005EB8"},
-    {"id":"LLY",   "name":"Eli Lilly & Co",          "sector":"Healthcare",    "currency":"USD","yf":"LLY",   "color":"#E11B22"},
-    {"id":"ABBV",  "name":"AbbVie Inc",              "sector":"Healthcare",    "currency":"USD","yf":"ABBV",  "color":"#071D49"},
-    {"id":"MRK",   "name":"Merck & Co",              "sector":"Healthcare",    "currency":"USD","yf":"MRK",   "color":"#00857C"},
-    {"id":"PFE",   "name":"Pfizer Inc",              "sector":"Healthcare",    "currency":"USD","yf":"PFE",   "color":"#0074C8"},
-    {"id":"TMO",   "name":"Thermo Fisher Scientific","sector":"Healthcare",    "currency":"USD","yf":"TMO",   "color":"#005C8E"},
-    {"id":"ABT",   "name":"Abbott Laboratories",     "sector":"Healthcare",    "currency":"USD","yf":"ABT",   "color":"#007AC2"},
-    {"id":"AMGN",  "name":"Amgen Inc",               "sector":"Healthcare",    "currency":"USD","yf":"AMGN",  "color":"#00579B"},
-    {"id":"ISRG",  "name":"Intuitive Surgical",      "sector":"Healthcare",    "currency":"USD","yf":"ISRG",  "color":"#00A99D"},
-    # ── Energy ────────────────────────────────────────────────────────────────
-    {"id":"XOM",   "name":"Exxon Mobil",             "sector":"Energy",        "currency":"USD","yf":"XOM",   "color":"#34D399"},
-    {"id":"CVX",   "name":"Chevron Corp",            "sector":"Energy",        "currency":"USD","yf":"CVX",   "color":"#009BDE"},
-    {"id":"COP",   "name":"ConocoPhillips",          "sector":"Energy",        "currency":"USD","yf":"COP",   "color":"#E31837"},
-    {"id":"SLB",   "name":"SLB (Schlumberger)",      "sector":"Energy",        "currency":"USD","yf":"SLB",   "color":"#00A3E0"},
-    {"id":"OXY",   "name":"Occidental Petroleum",    "sector":"Energy",        "currency":"USD","yf":"OXY",   "color":"#B31F2B"},
-    # ── Industrials ──────────────────────────────────────────────────────────
-    {"id":"CAT",   "name":"Caterpillar Inc",         "sector":"Industrial",    "currency":"USD","yf":"CAT",   "color":"#FFCD11"},
-    {"id":"BA",    "name":"Boeing Co",               "sector":"Industrial",    "currency":"USD","yf":"BA",    "color":"#1D428A"},
-    {"id":"GE",    "name":"GE Aerospace",            "sector":"Industrial",    "currency":"USD","yf":"GE",    "color":"#003057"},
-    {"id":"HON",   "name":"Honeywell International", "sector":"Industrial",    "currency":"USD","yf":"HON",   "color":"#E1001A"},
-    {"id":"UPS",   "name":"United Parcel Service",   "sector":"Industrial",    "currency":"USD","yf":"UPS",   "color":"#4B1C12"},
-    {"id":"RTX",   "name":"RTX Corp (Raytheon)",     "sector":"Industrial",    "currency":"USD","yf":"RTX",   "color":"#005EB8"},
-    {"id":"LMT",   "name":"Lockheed Martin Corp",    "sector":"Industrial",    "currency":"USD","yf":"LMT",   "color":"#003B70"},
-    # ── Materials ─────────────────────────────────────────────────────────────
-    {"id":"LIN",   "name":"Linde PLC",               "sector":"Materials",     "currency":"USD","yf":"LIN",   "color":"#009BDE"},
-    {"id":"NEM",   "name":"Newmont Corp (Gold)",      "sector":"Materials",     "currency":"USD","yf":"NEM",   "color":"#FFD700"},
-    {"id":"FCX",   "name":"Freeport-McMoRan (Copper)","sector":"Materials",    "currency":"USD","yf":"FCX",   "color":"#B87333"},
-    # ── ETFs ──────────────────────────────────────────────────────────────────
-    {"id":"SPY",   "name":"S&P 500 ETF (SPDR)",      "sector":"ETF",           "currency":"USD","yf":"SPY",   "color":"#FB923C"},
-    {"id":"QQQ",   "name":"Nasdaq 100 ETF",          "sector":"ETF",           "currency":"USD","yf":"QQQ",   "color":"#F472B6"},
-    {"id":"IWM",   "name":"Russell 2000 ETF",        "sector":"ETF",           "currency":"USD","yf":"IWM",   "color":"#A78BFA"},
-    {"id":"DIA",   "name":"Dow Jones ETF (SPDR)",    "sector":"ETF",           "currency":"USD","yf":"DIA",   "color":"#60A5FA"},
-    {"id":"GLD",   "name":"Gold ETF (SPDR)",         "sector":"ETF",           "currency":"USD","yf":"GLD",   "color":"#FFD700"},
-    {"id":"TLT",   "name":"20+ Year Treasury Bond ETF","sector":"ETF",         "currency":"USD","yf":"TLT",   "color":"#6EE7B7"},
-    {"id":"XLF",   "name":"Financial Sector ETF",    "sector":"ETF",           "currency":"USD","yf":"XLF",   "color":"#93C5FD"},
-    {"id":"XLE",   "name":"Energy Sector ETF",       "sector":"ETF",           "currency":"USD","yf":"XLE",   "color":"#6EE7B7"},
-    {"id":"XLK",   "name":"Technology Sector ETF",   "sector":"ETF",           "currency":"USD","yf":"XLK",   "color":"#A5F3FC"},
-]
-
-ALL_STOCKS = EU_STOCKS + ASIA_STOCKS + US_STOCKS
-
-# ── Seed prices (approximate current prices — overwritten by live yfinance fetch at startup) ─
-EU_SEEDS = {
-    "SHEL.L":{"price":2721,"change":0.42,"high":2745,"low":2698,"vol":15000000,"mktcap":"189B"},
-    "BP.L":{"price":452,"change":-0.31,"high":458,"low":448,"vol":35000000,"mktcap":"76B"},
-    "AZN.L":{"price":10520,"change":0.65,"high":10610,"low":10440,"vol":3500000,"mktcap":"198B"},
-    "HSBA.L":{"price":748,"change":0.28,"high":755,"low":743,"vol":25000000,"mktcap":"143B"},
-    "ULVR.L":{"price":2398,"change":0.15,"high":2415,"low":2382,"vol":4500000,"mktcap":"58B"},
-    "GSK.L":{"price":1385,"change":-0.22,"high":1398,"low":1375,"vol":8000000,"mktcap":"55B"},
-    "RIO.L":{"price":4820,"change":0.88,"high":4865,"low":4780,"vol":4000000,"mktcap":"72B"},
-    "MC.PA":{"price":695,"change":0.55,"high":701,"low":689,"vol":500000,"mktcap":"347B"},
-    "OR.PA":{"price":348,"change":0.33,"high":351,"low":345,"vol":600000,"mktcap":"190B"},
-    "TTE.PA":{"price":56.2,"change":0.45,"high":56.8,"low":55.8,"vol":5000000,"mktcap":"135B"},
-    "AIR.PA":{"price":168,"change":0.72,"high":169.5,"low":166.5,"vol":1200000,"mktcap":"131B"},
-    "BNP.PA":{"price":69.5,"change":0.38,"high":70.2,"low":69.0,"vol":3000000,"mktcap":"84B"},
-    "RMS.PA":{"price":2145,"change":0.82,"high":2165,"low":2128,"vol":120000,"mktcap":"227B"},
-    "SAN.PA":{"price":91.2,"change":-0.15,"high":92.0,"low":90.8,"vol":2500000,"mktcap":"116B"},
-    "SAP.DE":{"price":242,"change":0.68,"high":244,"low":240,"vol":1800000,"mktcap":"295B"},
-    "SIE.DE":{"price":197,"change":0.42,"high":198.5,"low":195.5,"vol":1500000,"mktcap":"157B"},
-    "BMW.DE":{"price":76.5,"change":-0.28,"high":77.2,"low":76.0,"vol":2800000,"mktcap":"46B"},
-    "MBG.DE":{"price":61.2,"change":-0.42,"high":62.0,"low":60.8,"vol":3500000,"mktcap":"62B"},
-    "VOW3.DE":{"price":102,"change":-0.55,"high":103.5,"low":101.5,"vol":2000000,"mktcap":"51B"},
-    "ALV.DE":{"price":292,"change":0.52,"high":294,"low":290,"vol":900000,"mktcap":"118B"},
-    "ADS.DE":{"price":218,"change":0.65,"high":220,"low":216,"vol":800000,"mktcap":"37B"},
-    "DTE.DE":{"price":29.2,"change":0.21,"high":29.5,"low":29.0,"vol":8000000,"mktcap":"135B"},
-    "NESN.SW":{"price":86.5,"change":-0.12,"high":87.2,"low":86.0,"vol":5000000,"mktcap":"228B"},
-    "ROG.SW":{"price":268,"change":0.35,"high":270,"low":266,"vol":1800000,"mktcap":"148B"},
-    "NOVN.SW":{"price":91.5,"change":0.22,"high":92.2,"low":91.0,"vol":4000000,"mktcap":"195B"},
-    "ASML.AS":{"price":712,"change":1.12,"high":718,"low":706,"vol":800000,"mktcap":"280B"},
-    "NOVO-B.CO":{"price":645,"change":0.88,"high":651,"low":639,"vol":5000000,"mktcap":"288B"},
-    "RACE.MI":{"price":392,"change":0.55,"high":395,"low":389,"vol":300000,"mktcap":"71B"},
-    "ENI.MI":{"price":13.8,"change":0.22,"high":14.0,"low":13.7,"vol":12000000,"mktcap":"45B"},
+// ── CLOCK ──────────────────────────────────────────────────────
+function updateClock() {
+  const now = new Date();
+  document.getElementById("clock").textContent = now.toUTCString().slice(17,25) + " UTC";
 }
+setInterval(updateClock, 1000);
+updateClock();
 
-ASIA_SEEDS = {
-    "7203.T":{"price":3620,"change":0.55,"high":3650,"low":3590,"vol":8000000,"mktcap":"235B"},
-    "6758.T":{"price":2715,"change":0.82,"high":2740,"low":2690,"vol":6000000,"mktcap":"168B"},
-    "9984.T":{"price":9120,"change":1.25,"high":9200,"low":9050,"vol":3500000,"mktcap":"151B"},
-    "7974.T":{"price":8520,"change":-0.35,"high":8580,"low":8460,"vol":1200000,"mktcap":"110B"},
-    "6501.T":{"price":3415,"change":0.68,"high":3440,"low":3390,"vol":2000000,"mktcap":"74B"},
-    "8306.T":{"price":1712,"change":0.42,"high":1725,"low":1698,"vol":15000000,"mktcap":"118B"},
-    "0700.HK":{"price":398,"change":0.75,"high":402,"low":394,"vol":18000000,"mktcap":"384B"},
-    "9988.HK":{"price":92.5,"change":1.05,"high":93.8,"low":91.5,"vol":25000000,"mktcap":"188B"},
-    "3690.HK":{"price":152,"change":0.88,"high":154,"low":150,"vol":12000000,"mktcap":"97B"},
-    "9618.HK":{"price":147,"change":0.62,"high":149,"low":145,"vol":8000000,"mktcap":"91B"},
-    "2318.HK":{"price":38.5,"change":-0.22,"high":39.0,"low":38.2,"vol":20000000,"mktcap":"68B"},
-    "RELIANCE.NS":{"price":1458,"change":0.35,"high":1468,"low":1445,"vol":5000000,"mktcap":"193B"},
-    "HDFCBANK.NS":{"price":1712,"change":0.28,"high":1722,"low":1700,"vol":8000000,"mktcap":"130B"},
-    "TCS.NS":{"price":3521,"change":0.42,"high":3545,"low":3498,"vol":2500000,"mktcap":"128B"},
-    "INFY.NS":{"price":1598,"change":0.55,"high":1610,"low":1585,"vol":6000000,"mktcap":"66B"},
-    "ICICIBANK.NS":{"price":1312,"change":0.68,"high":1322,"low":1300,"vol":10000000,"mktcap":"92B"},
-    "005930.KS":{"price":74800,"change":0.95,"high":75200,"low":74400,"vol":12000000,"mktcap":"446B"},
-    "TSM":{"price":186.5,"change":1.12,"high":188.0,"low":185.0,"vol":15000000,"mktcap":"968B"},
-    "SE":{"price":76.2,"change":1.35,"high":77.0,"low":75.5,"vol":5000000,"mktcap":"43B"},
-    "GRAB":{"price":3.52,"change":0.85,"high":3.56,"low":3.48,"vol":18000000,"mktcap":"13B"},
-}
+// ── INIT ───────────────────────────────────────────────────────
+window.addEventListener("DOMContentLoaded", async () => {
+  try {
+    const res  = await fetch("/api/seed");
+    const data = await res.json();
+    euStocks   = data.eu_stocks   || [];
+    asiaStocks = data.asia_stocks || [];
+    usStocks   = data.us_stocks   || [];
+    marketEu   = data.market_eu   || {};
+    marketAs   = data.market_as   || {};
+    marketUs   = data.market_us   || {};
 
-US_SEEDS = {
-    # Technology
-    "AAPL":  {"price":198.5, "change":0.84, "high":200.1,"low":197.0,"vol":52000000, "mktcap":"3.02T"},
-    "MSFT":  {"price":452.3, "change":0.62, "high":454.1,"low":450.5,"vol":18000000, "mktcap":"3.36T"},
-    "NVDA":  {"price":135.2, "change":2.31, "high":137.0,"low":133.5,"vol":42000000, "mktcap":"3.31T"},
-    "GOOGL": {"price":175.8, "change":0.55, "high":177.2,"low":174.3,"vol":21000000, "mktcap":"2.17T"},
-    "META":  {"price":605.7, "change":1.44, "high":609.0,"low":602.1,"vol":15000000, "mktcap":"1.54T"},
-    "AMD":   {"price":108.4, "change":1.21, "high":110.0,"low":107.0,"vol":35000000, "mktcap":"176B"},
-    "INTC":  {"price":21.3,  "change":-0.85,"high":21.8, "low":21.0, "vol":50000000, "mktcap":"91B"},
-    "AVGO":  {"price":233.5, "change":0.92, "high":235.0,"low":232.0,"vol":8000000,  "mktcap":"1.09T"},
-    "QCOM":  {"price":155.2, "change":0.43, "high":156.5,"low":154.0,"vol":9000000,  "mktcap":"172B"},
-    "CRM":   {"price":272.8, "change":0.65, "high":274.5,"low":271.0,"vol":5000000,  "mktcap":"263B"},
-    "ORCL":  {"price":168.3, "change":0.82, "high":169.8,"low":167.0,"vol":6000000,  "mktcap":"462B"},
-    "ADBE":  {"price":368.5, "change":0.55, "high":370.5,"low":367.0,"vol":3000000,  "mktcap":"162B"},
-    "IBM":   {"price":238.4, "change":0.31, "high":239.5,"low":237.5,"vol":4000000,  "mktcap":"218B"},
-    "UBER":  {"price":72.5,  "change":1.15, "high":73.2, "low":71.8, "vol":18000000, "mktcap":"152B"},
-    "PLTR":  {"price":125.8, "change":2.30, "high":127.5,"low":124.0,"vol":55000000, "mktcap":"272B"},
-    "SNOW":  {"price":171.2, "change":1.05, "high":172.8,"low":170.0,"vol":4000000,  "mktcap":"57B"},
-    "NFLX":  {"price":1148.4,"change":1.27, "high":1155.0,"low":1142.0,"vol":5200000,"mktcap":"488B"},
-    # Consumer
-    "AMZN":  {"price":200.4, "change":1.12, "high":202.1,"low":198.8,"vol":35000000, "mktcap":"2.14T"},
-    "TSLA":  {"price":339.3, "change":-1.82,"high":345.5,"low":337.0,"vol":88000000, "mktcap":"1.09T"},
-    "WMT":   {"price":97.3,  "change":0.33, "high":97.9, "low":96.7, "vol":14000000, "mktcap":"262B"},
-    "DIS":   {"price":99.3,  "change":-0.45,"high":100.2,"low":98.5, "vol":12000000, "mktcap":"181B"},
-    "NKE":   {"price":62.4,  "change":-0.31,"high":63.0, "low":61.8, "vol":9000000,  "mktcap":"93B"},
-    "MCD":   {"price":310.5, "change":0.45, "high":312.0,"low":309.0,"vol":3000000,  "mktcap":"222B"},
-    "SBUX":  {"price":87.2,  "change":-0.22,"high":88.0, "low":86.5, "vol":7000000,  "mktcap":"97B"},
-    "HD":    {"price":395.8, "change":0.67, "high":397.5,"low":394.0,"vol":4000000,  "mktcap":"389B"},
-    "COST":  {"price":1018.5,"change":0.88, "high":1023.0,"low":1015.0,"vol":1800000,"mktcap":"452B"},
-    "CMG":   {"price":51.4,  "change":0.55, "high":52.0, "low":51.0, "vol":2500000,  "mktcap":"143B"},
-    "GM":    {"price":52.3,  "change":0.82, "high":52.8, "low":51.8, "vol":14000000, "mktcap":"45B"},
-    "F":     {"price":11.2,  "change":-0.45,"high":11.5, "low":11.0, "vol":40000000, "mktcap":"43B"},
-    # Finance
-    "BRK-B": {"price":548.6, "change":0.28, "high":550.0,"low":547.0,"vol":3400000,  "mktcap":"1.21T"},
-    "JPM":   {"price":271.4, "change":0.61, "high":272.6,"low":270.1,"vol":9200000,  "mktcap":"775B"},
-    "V":     {"price":368.9, "change":0.43, "high":370.1,"low":367.5,"vol":7100000,  "mktcap":"756B"},
-    "MA":    {"price":556.8, "change":0.55, "high":558.5,"low":555.0,"vol":2500000,  "mktcap":"501B"},
-    "BAC":   {"price":46.2,  "change":0.68, "high":46.6, "low":45.8, "vol":41000000, "mktcap":"354B"},
-    "GS":    {"price":617.5, "change":0.82, "high":619.5,"low":615.5,"vol":2000000,  "mktcap":"199B"},
-    "MS":    {"price":128.4, "change":0.55, "high":129.5,"low":127.5,"vol":8000000,  "mktcap":"211B"},
-    "WFC":   {"price":76.3,  "change":0.43, "high":76.8, "low":75.8, "vol":14000000, "mktcap":"256B"},
-    "C":     {"price":76.5,  "change":0.61, "high":77.0, "low":76.0, "vol":16000000, "mktcap":"143B"},
-    "AXP":   {"price":302.8, "change":0.44, "high":304.0,"low":301.5,"vol":3500000,  "mktcap":"211B"},
-    "PYPL":  {"price":72.5,  "change":-0.32,"high":73.0, "low":72.0, "vol":10000000, "mktcap":"72B"},
-    "SCHW":  {"price":77.8,  "change":0.52, "high":78.3, "low":77.3, "vol":8000000,  "mktcap":"138B"},
-    "COIN":  {"price":235.8, "change":3.41, "high":239.5,"low":228.3,"vol":14000000, "mktcap":"59B"},
-    # Healthcare
-    "JNJ":   {"price":154.2, "change":-0.19,"high":155.0,"low":153.5,"vol":8800000,  "mktcap":"369B"},
-    "UNH":   {"price":288.5, "change":0.72, "high":290.0,"low":287.0,"vol":5000000,  "mktcap":"265B"},
-    "LLY":   {"price":745.2, "change":1.12, "high":749.0,"low":742.0,"vol":4000000,  "mktcap":"709B"},
-    "ABBV":  {"price":201.3, "change":0.45, "high":202.5,"low":200.0,"vol":5500000,  "mktcap":"355B"},
-    "MRK":   {"price":82.5,  "change":-0.25,"high":83.0, "low":82.0, "vol":9000000,  "mktcap":"208B"},
-    "PFE":   {"price":26.8,  "change":-0.45,"high":27.2, "low":26.5, "vol":30000000, "mktcap":"151B"},
-    "TMO":   {"price":455.8, "change":0.62, "high":457.5,"low":454.0,"vol":2500000,  "mktcap":"173B"},
-    "ABT":   {"price":128.5, "change":0.38, "high":129.5,"low":127.5,"vol":5000000,  "mktcap":"222B"},
-    "AMGN":  {"price":282.5, "change":0.42, "high":284.0,"low":281.0,"vol":3500000,  "mktcap":"149B"},
-    "ISRG":  {"price":552.8, "change":0.85, "high":555.0,"low":550.5,"vol":1200000,  "mktcap":"195B"},
-    # Energy
-    "XOM":   {"price":110.7, "change":0.77, "high":111.5,"low":109.8,"vol":16000000, "mktcap":"446B"},
-    "CVX":   {"price":155.3, "change":0.55, "high":156.0,"low":154.5,"vol":10000000, "mktcap":"288B"},
-    "COP":   {"price":94.5,  "change":0.42, "high":95.2, "low":93.8, "vol":8000000,  "mktcap":"120B"},
-    "SLB":   {"price":40.2,  "change":0.35, "high":40.8, "low":39.8, "vol":12000000, "mktcap":"57B"},
-    "OXY":   {"price":44.8,  "change":0.62, "high":45.2, "low":44.4, "vol":9000000,  "mktcap":"41B"},
-    # Industrial
-    "CAT":   {"price":358.5, "change":0.72, "high":360.5,"low":357.0,"vol":3000000,  "mktcap":"172B"},
-    "BA":    {"price":175.8, "change":-0.85,"high":177.0,"low":174.5,"vol":8000000,  "mktcap":"133B"},
-    "GE":    {"price":208.5, "change":0.62, "high":209.8,"low":207.5,"vol":5500000,  "mktcap":"226B"},
-    "HON":   {"price":224.8, "change":0.35, "high":225.8,"low":223.8,"vol":3000000,  "mktcap":"143B"},
-    "UPS":   {"price":101.5, "change":-0.22,"high":102.0,"low":101.0,"vol":4000000,  "mktcap":"87B"},
-    "RTX":   {"price":128.5, "change":0.45, "high":129.0,"low":128.0,"vol":6000000,  "mktcap":"172B"},
-    "LMT":   {"price":468.5, "change":0.35, "high":470.0,"low":467.0,"vol":1500000,  "mktcap":"108B"},
-    # Materials
-    "LIN":   {"price":488.5, "change":0.42, "high":490.0,"low":487.0,"vol":1500000,  "mktcap":"234B"},
-    "NEM":   {"price":55.2,  "change":0.88, "high":55.8, "low":54.7, "vol":12000000, "mktcap":"43B"},
-    "FCX":   {"price":41.5,  "change":1.12, "high":42.0, "low":41.0, "vol":18000000, "mktcap":"59B"},
-    # ETFs
-    "SPY":   {"price":592.1, "change":0.51, "high":593.8,"low":590.4,"vol":65000000, "mktcap":"590B"},
-    "QQQ":   {"price":522.2, "change":0.72, "high":524.0,"low":520.5,"vol":38000000, "mktcap":"312B"},
-    "IWM":   {"price":205.8, "change":0.45, "high":206.5,"low":205.0,"vol":25000000, "mktcap":"62B"},
-    "DIA":   {"price":432.5, "change":0.38, "high":433.5,"low":431.5,"vol":5000000,  "mktcap":"34B"},
-    "GLD":   {"price":306.5, "change":0.55, "high":307.4,"low":305.6,"vol":9800000,  "mktcap":"108B"},
-    "TLT":   {"price":85.2,  "change":-0.22,"high":85.8, "low":84.8, "vol":25000000, "mktcap":"58B"},
-    "XLF":   {"price":51.5,  "change":0.35, "high":51.8, "low":51.2, "vol":30000000, "mktcap":"46B"},
-    "XLE":   {"price":88.5,  "change":0.42, "high":89.0, "low":88.0, "vol":15000000, "mktcap":"36B"},
-    "XLK":   {"price":242.5, "change":0.68, "high":243.5,"low":241.5,"vol":8000000,  "mktcap":"68B"},
-}
+    renderDashboard();
+    renderEuAsiaPage();
+    renderUsPage();
+    renderPredSidebar();
+    renderJournal();
+    startSSE();
+  } catch(e) {
+    console.error("Init failed:", e);
+    document.getElementById("kpi-grid").innerHTML =
+      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">
+        ⚠ Cannot connect. Make sure app.py is running on port 5002.
+      </div>`;
+  }
 
-def _fetch_yf_seeds(stock_list, seeds_dict, label):
-    """Generic yfinance seed fetcher for any stock list."""
-    try:
-        import yfinance as _yf
-        ticker_map = {s["yf"]: s["id"] for s in stock_list if s.get("yf")}
-        print(f"[STARTUP] Fetching live {label} prices for {len(ticker_map)} tickers...")
-        raw = _yf.download(
-            tickers=list(ticker_map.keys()),
-            period="5d", interval="1d",
-            auto_adjust=True, progress=False,
-            threads=False, group_by="ticker",
-        )
-        updated = 0
-        for yf_tick, stock_id in ticker_map.items():
-            try:
-                if len(ticker_map) == 1:
-                    col = raw["Close"]
-                else:
-                    if yf_tick not in raw.columns.get_level_values(0):
-                        continue
-                    col = raw[yf_tick]["Close"]
-                col = col.dropna()
-                if len(col) >= 2:
-                    prev = float(col.iloc[-2])
-                    price = float(col.iloc[-1])
-                    if price > 0 and stock_id in seeds_dict:
-                        ch = round((price - prev) / (prev + 1e-9) * 100, 4)
-                        seeds_dict[stock_id]["price"] = round(price, 2)
-                        seeds_dict[stock_id]["change"] = ch
-                        seeds_dict[stock_id]["high"] = round(price * 1.005, 2)
-                        seeds_dict[stock_id]["low"] = round(price * 0.995, 2)
-                        updated += 1
-            except Exception:
-                pass
-        print(f"[STARTUP] Live prices loaded for {updated}/{len(ticker_map)} {label} stocks.")
-    except Exception as e:
-        print(f"[STARTUP] {label} yfinance fetch failed ({e}), using hardcoded seeds.")
+  // Nav
+  document.querySelectorAll(".nav-item").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const page = btn.dataset.page;
+      document.querySelectorAll(".nav-item").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+      const el = document.getElementById("page-" + page);
+      if (el) { el.classList.add("active"); }
+      currentPage = page;
+    });
+  });
 
-def _fetch_live_eu_seeds():
-    """Fetch live EU stock prices from yfinance at startup."""
-    _fetch_yf_seeds(EU_STOCKS, EU_SEEDS, "EU")
+  document.getElementById("analyze-btn").addEventListener("click", runAnalysis);
+  document.getElementById("scan-btn").addEventListener("click", runScan);
+  document.getElementById("add-trade-btn").addEventListener("click", () => {
+    document.getElementById("add-trade-form").classList.toggle("hidden");
+  });
+  document.getElementById("export-csv-btn").addEventListener("click", exportTrades);
 
-def _fetch_live_asia_seeds():
-    """Fetch live Asian stock prices from yfinance at startup."""
-    _fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA")
+  // Drag-drop on upload zone
+  const zone = document.getElementById("upload-zone");
+  zone.addEventListener("dragover", e => { e.preventDefault(); zone.classList.add("dragover"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+  zone.addEventListener("drop", e => {
+    e.preventDefault(); zone.classList.remove("dragover");
+    const file = e.dataTransfer.files[0];
+    if (file) handleChartFile(file);
+  });
+});
 
-def _fetch_live_us_seeds():
-    """Fetch current US prices from yfinance at startup to replace stale hardcoded seeds."""
-    _fetch_yf_seeds(US_STOCKS, US_SEEDS, "US")
-
-_fetch_yf_seeds(EU_STOCKS, EU_SEEDS, "EU")
-_fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA")
-_fetch_live_us_seeds()
-
-market_eu = {s["id"]: {**EU_SEEDS.get(s["id"], {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})} for s in EU_STOCKS}
-market_as = {s["id"]: {**ASIA_SEEDS.get(s["id"], {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})} for s in ASIA_STOCKS}
-market_us = {s["id"]: {**US_SEEDS.get(s["id"], {"price":100,"change":0,"high":101,"low":99,"vol":1000000,"mktcap":"N/A"})} for s in US_STOCKS}
-
-# ── Broadcast SSE ─────────────────────────────────────────────────────────────
-subscribers = []
-subscribers_lock = threading.Lock()
-ws_status = "connecting"
-
-def broadcast(data):
-    msg = "data: " + json.dumps(data) + "\n\n"
-    with subscribers_lock:
-        dead = []
-        for q in subscribers:
-            try: q.put_nowait(msg)
-            except: dead.append(q)
-        for q in dead: subscribers.remove(q)
-
-# ── US price fetcher — yfinance isolated in a real OS thread ─────────────────
-# yfinance uses curl_cffi (native libcurl) which cannot be patched by eventlet.
-# We run it in a stdlib threading.Thread (not a greenthread) via a daemon
-# worker that loops independently, writing results into a shared dict.
-# The eventlet greenthread only reads from that dict — no blocking.
-
-import threading as _threading
-import queue as _queue
-
-_price_result_queue = _queue.Queue(maxsize=1)
-
-def _yf_worker_loop():
-    """Runs in a real OS thread — curl_cffi/libcurl safe. Fetches prices
-    for all EU, Asian, and US tickers using yfinance and pushes results to the queue."""
-    ticker_map = {s["yf"]: s["id"] for s in (EU_STOCKS + ASIA_STOCKS + US_STOCKS) if s.get("yf")}
-    import yfinance as _yf
-    import time as _t
-    while True:
-        results = {}
-        try:
-            raw = _yf.download(
-                tickers=list(ticker_map.keys()),
-                period="1d", interval="5m",
-                auto_adjust=True, progress=False,
-                threads=False, group_by="ticker",
-            )
-            for yf_tick, stock_id in ticker_map.items():
-                try:
-                    if len(ticker_map) == 1:
-                        col = raw["Close"]
-                    else:
-                        if yf_tick not in raw.columns.get_level_values(0):
-                            continue
-                        col = raw[yf_tick]["Close"]
-                    col = col.dropna()
-                    if len(col) > 0:
-                        p = float(col.iloc[-1])
-                        if p > 0:
-                            results[stock_id] = round(p, 2)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"[YF WORKER] {e}")
-        # Drain old result then push fresh one (non-blocking)
-        try: _price_result_queue.get_nowait()
-        except _queue.Empty: pass
-        try: _price_result_queue.put_nowait(results)
-        except _queue.Full: pass
-        _t.sleep(30)   # fetch every 30 s from the OS thread
-
-# Start the real-thread worker once at import time
-_yf_thread = _threading.Thread(target=_yf_worker_loop, daemon=True, name="yf-worker")
-_yf_thread.start()
-
-def fetch_stock_prices():
-    """Read the latest yfinance results from the OS-thread worker (non-blocking)."""
-    try:
-        return _price_result_queue.get_nowait()
-    except _queue.Empty:
-        return {}
-
-def simulate_tick_stock(stock_id, cur, currency):
-    p = cur.get("price", 100)
-    tick_size = p * random.uniform(0.0002, 0.0015)
-    d = 1 if random.random() > 0.47 else -1
-    dec = 2
-    np_ = round(p + d * tick_size, dec)
-    all_markets = {**market_eu, **market_as, **market_us}
-    seed_price = all_markets.get(stock_id, {}).get("price", p)
-    ch = round((np_ - seed_price) / (seed_price + 1e-9) * 100, 4)
-    return np_, ch
-
-def price_poll_thread():
-    """Poll EU, Asian, and US stocks via Yahoo Finance every 15s; fallback to simulation."""
-    _fail_count = 0
-    _backoff_until = 0
-    while True:
-        try:
-            if time.time() > _backoff_until:
-                prices = fetch_stock_prices()
-                if prices:
-                    _fail_count = 0
-                    for stock_id, price in prices.items():
-                        if stock_id in market_eu:
-                            seed_price = market_eu[stock_id].get("price") or price
-                            ch = round((price - seed_price) / (seed_price + 1e-9) * 100, 4)
-                            market_eu[stock_id]["price"] = price
-                            market_eu[stock_id]["change"] = ch
-                            broadcast({"type": "tick", "market": "eu", "id": stock_id, "price": price, "change": ch})
-                        elif stock_id in market_as:
-                            seed_price = market_as[stock_id].get("price") or price
-                            ch = round((price - seed_price) / (seed_price + 1e-9) * 100, 4)
-                            market_as[stock_id]["price"] = price
-                            market_as[stock_id]["change"] = ch
-                            broadcast({"type": "tick", "market": "as", "id": stock_id, "price": price, "change": ch})
-                        elif stock_id in market_us:
-                            seed_price = market_us[stock_id].get("price") or price
-                            ch = round((price - seed_price) / (seed_price + 1e-9) * 100, 4)
-                            market_us[stock_id]["price"] = price
-                            market_us[stock_id]["change"] = ch
-                            broadcast({"type": "tick", "market": "us", "id": stock_id, "price": price, "change": ch})
-                    broadcast({"type": "status", "status": "live"})
-                    time.sleep(15)
-                    continue
-                else:
-                    _fail_count += 1
-        except Exception as e:
-            _fail_count += 1
-            print(f"[PRICE POLL] {e}")
-
-        # After 3 consecutive failures, back off for 5 minutes
-        if _fail_count >= 3:
-            print(f"[PRICE POLL] {_fail_count} failures — backing off 5 min, using simulation")
-            _backoff_until = time.time() + 300
-            _fail_count = 0
-
-        # Simulate all stocks while live feed is unavailable
-        for s in EU_STOCKS:
-            p, ch = simulate_tick_stock(s["id"], market_eu[s["id"]], s["currency"])
-            market_eu[s["id"]]["price"] = p
-            market_eu[s["id"]]["change"] = ch
-            broadcast({"type": "tick", "market": "eu", "id": s["id"], "price": p, "change": ch})
-        for s in ASIA_STOCKS:
-            p, ch = simulate_tick_stock(s["id"], market_as[s["id"]], s["currency"])
-            market_as[s["id"]]["price"] = p
-            market_as[s["id"]]["change"] = ch
-            broadcast({"type": "tick", "market": "as", "id": s["id"], "price": p, "change": ch})
-        for s in US_STOCKS:
-            p, ch = simulate_tick_stock(s["id"], market_us[s["id"]], "USD")
-            market_us[s["id"]]["price"] = p
-            market_us[s["id"]]["change"] = ch
-            broadcast({"type": "tick", "market": "us", "id": s["id"], "price": p, "change": ch})
-        broadcast({"type": "status", "status": "simulated"})
-        time.sleep(15)
-
-threading.Thread(target=price_poll_thread, daemon=True).start()
-
-# ── Technical indicator helpers ───────────────────────────────────────────────
-def _rsi(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = (-d.clip(upper=0)).rolling(p).mean()
-    return 100 - 100 / (1 + g / (l + 1e-9))
-
-def _ema(s, p):
-    return s.ewm(span=p, adjust=False).mean()
-
-def _atr(h, l, c, p=14):
-    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    return tr.rolling(p).mean()
-
-def _macd(c, f=12, sl=26, sig=9):
-    ml = _ema(c, f) - _ema(c, sl)
-    sig_ = _ema(ml, sig)
-    return ml, sig_, ml - sig_
-
-def _bollinger(c, p=20, k=2):
-    m = c.rolling(p).mean(); s = c.rolling(p).std()
-    up, lo = m + k*s, m - k*s
-    return up, m, lo, (c - lo)/(up - lo + 1e-9), (up - lo)/(m + 1e-9)
-
-def _stoch(h, l, c, k=14, d=3):
-    K = 100*(c - l.rolling(k).min())/(h.rolling(k).max() - l.rolling(k).min() + 1e-9)
-    return K, K.rolling(d).mean()
-
-def _adx(h, l, c, p=14):
-    up = h.diff(); dn = -l.diff()
-    pdm = np.where((up > dn) & (up > 0), up, 0.0)
-    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr_s = _atr(h, l, c, p)
-    pdi = 100 * pd.Series(pdm, index=h.index).rolling(p).mean() / (tr_s + 1e-9)
-    mdi = 100 * pd.Series(mdm, index=h.index).rolling(p).mean() / (tr_s + 1e-9)
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
-    return dx.rolling(p).mean(), pdi, mdi
-
-_ohlcv_cache = {}
-_ohlcv_cache_ts = {}
-
-def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
-    if not _yf_ok or not ticker:
-        return None
-    cache_key = f"{ticker}_{period}_{interval}"
-    now = time.time()
-    if cache_key in _ohlcv_cache and now - _ohlcv_cache_ts.get(cache_key, 0) < 3600:
-        return _ohlcv_cache[cache_key]
-    try:
-        df = yf.download(ticker, period=period, interval=interval,
-                         auto_adjust=True, progress=False, threads=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).strip().title() for c in df.columns]
-        if df.empty or "Close" not in df.columns:
-            return None
-        df = df[["Open","High","Low","Close","Volume"]].dropna()
-        if len(df) < 20:
-            return None
-        _ohlcv_cache[cache_key] = df
-        _ohlcv_cache_ts[cache_key] = now
-        return df
-    except Exception as e:
-        print(f"[OHLCV] {ticker}: {e}")
-        return None
-
-def compute_indicators(df):
-    c, h, l, v, o = df["Close"], df["High"], df["Low"], df["Volume"], df["Open"]
-
-    rsi14  = _rsi(c, 14)
-    rsi7   = _rsi(c, 7)
-    ml, sl_, hist = _macd(c)
-    bb_up, bb_mid, bb_lo, pct_b, bw = _bollinger(c)
-    atr14  = _atr(h, l, c, 14)
-    ema9   = _ema(c, 9)
-    ema21  = _ema(c, 21)
-    ema50  = _ema(c, 50)
-    ema200 = _ema(c, 200)
-    k_, d_ = _stoch(h, l, c)
-    adx_, pdi, mdi = _adx(h, l, c)
-    v_ma20 = v.rolling(20).mean()
-
-    def last(s):
-        v2 = s.dropna()
-        return float(v2.iloc[-1]) if len(v2) > 0 else 0.0
-
-    rsi_v    = last(rsi14)
-    rsi7_v   = last(rsi7)
-    macd_l   = last(ml)
-    macd_s   = last(sl_)
-    macd_h   = last(hist)
-    bb_pct   = last(pct_b) * 100
-    atr_v    = last(atr14)
-    ema9_v   = last(ema9)
-    ema21_v  = last(ema21)
-    ema50_v  = last(ema50)
-    ema200_v = last(ema200)
-    stoch_k  = last(k_)
-    stoch_d  = last(d_)
-    adx_v    = last(adx_)
-    pdi_v    = last(pdi)
-    mdi_v    = last(mdi)
-    price    = last(c)
-    bb_u     = last(bb_up)
-    bb_lo_v  = last(bb_lo)
-    vol_r    = last(v) / (last(v_ma20) + 1e-9)
-
-    macd_dir = "BULLISH" if macd_l > macd_s else "BEARISH"
-    atr_pct  = atr_v / price * 100 if price > 0 else 0
-
-    # Candle pattern
-    body = abs(float(c.iloc[-1]) - float(o.iloc[-1]))
-    rng  = max(float(h.iloc[-1]) - float(l.iloc[-1]), 1e-9)
-    uw   = (float(h.iloc[-1]) - max(float(c.iloc[-1]), float(o.iloc[-1]))) / rng
-    lw   = (min(float(c.iloc[-1]), float(o.iloc[-1])) - float(l.iloc[-1])) / rng
-    br   = body / rng
-    if br < 0.1: candle = "DOJI"
-    elif lw > 0.6 and uw < 0.15: candle = "HAMMER"
-    elif uw > 0.6 and lw < 0.15: candle = "SHOOTING STAR"
-    else: candle = "BULLISH BAR" if float(c.iloc[-1]) > float(o.iloc[-1]) else "BEARISH BAR"
-
-    return {
-        "rsi": round(rsi_v, 1), "rsi_7": round(rsi7_v, 1),
-        "macd": macd_dir, "macd_line": round(macd_l, 4), "macd_hist": round(macd_h, 4),
-        "bb_pct": round(bb_pct, 1), "bb_upper": round(bb_u, 2), "bb_lower": round(bb_lo_v, 2),
-        "atr": round(atr_pct, 4), "atr_raw": round(atr_v, 2),
-        "ema9": round(ema9_v, 2), "ema21": round(ema21_v, 2),
-        "ema50": round(ema50_v, 2), "ema200": round(ema200_v, 2),
-        "stoch_k": round(stoch_k, 1), "stoch_d": round(stoch_d, 1),
-        "adx": round(adx_v, 1), "plus_di": round(pdi_v, 1), "minus_di": round(mdi_v, 1),
-        "vol_ratio": round(vol_r, 2), "candle": candle, "price": round(price, 2),
+// ── SSE ────────────────────────────────────────────────────────
+function startSSE() {
+  if (sseSource) sseSource.close();
+  sseSource = new EventSource("/api/stream");
+  sseSource.onopen = () => setWsStatus("connecting");
+  sseSource.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "snapshot") {
+      marketEu = msg.market_eu || marketEu;
+      marketAs = msg.market_as || marketAs;
+      marketUs = msg.market_us || marketUs;
+      refreshAll();
+      setWsStatus("simulated");
     }
-
-def rule_based_signal(ind, ch):
-    b = br = 0
-    rsi = ind["rsi"]; macd = ind["macd"]; bb = ind["bb_pct"]
-    stoch = ind["stoch_k"]; adx = ind["adx"]
-    if rsi < 30: b += 3
-    elif rsi > 70: br += 3
-    elif rsi < 50: b += 1
-    else: br += 1
-    if macd == "BULLISH": b += 3
-    else: br += 3
-    if bb < 20: b += 2
-    elif bb > 80: br += 2
-    if stoch < 20: b += 2
-    elif stoch > 80: br += 2
-    if ch > 1: b += 2
-    elif ch < -1: br += 2
-    T = b + br
-    bp = round(b / T * 100) if T else 50
-    direction = "BULLISH" if bp >= 60 else "BEARISH" if bp <= 40 else "NEUTRAL"
-    conf = round(min(88, max(20, abs(bp - 50) * 2.2)))
-    if adx < 18 and direction != "NEUTRAL" and conf < 55:
-        direction = "NEUTRAL"; conf = round(conf * 0.6)
-    return direction, conf, bp
-
-def swing_levels(df):
-    """Extract recent swing highs and lows for TP/SL."""
-    h = df["High"].values
-    l = df["Low"].values
-    sw = 5
-    highs, lows = [], []
-    for i in range(sw, len(h) - sw):
-        if h[i] == max(h[i-sw:i+sw+1]): highs.append(float(h[i]))
-        if l[i] == min(l[i-sw:i+sw+1]): lows.append(float(l[i]))
-    return sorted(set(highs)), sorted(set(lows), reverse=True)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NEWS
-# ══════════════════════════════════════════════════════════════════════════════
-
-_news_cache = {}
-_news_cache_lock = threading.Lock()
-NEWS_TTL = 600
-
-STOCK_KEYWORDS = {
-    "beat":+2.5, "record":+2.0, "profit":+1.8, "revenue growth":+2.0, "upgrade":+2.0,
-    "buy rating":+2.0, "strong earnings":+2.5, "dividend":+1.5, "buyback":+1.8,
-    "expansion":+1.5, "acquisition":+1.2, "partnership":+1.2, "growth":+1.5,
-    "miss":-2.5, "loss":-2.0, "downgrade":-2.0, "sell rating":-2.0, "weak earnings":-2.5,
-    "layoff":-1.8, "recall":-1.5, "investigation":-2.0, "fraud":-2.5, "debt":-1.5,
-    "lawsuit":-1.8, "decline":-1.5, "cut":-1.5, "warning":-2.0,
+    if (msg.type === "tick") handleTick(msg);
+    if (msg.type === "status") setWsStatus(msg.status);
+  };
+  sseSource.onerror = () => setWsStatus("error");
 }
 
-def fetch_stock_news(stock_id, stock_name):
-    key = stock_id
-    now = time.time()
-    with _news_cache_lock:
-        cached = _news_cache.get(key)
-        if cached and (now - cached["ts"]) < NEWS_TTL:
-            return cached["items"]
-    items = []
-    # Use GNews RSS feed filtered by stock name/id — free, no key required
-    queries = [stock_id, stock_name.split(" ")[0]]  # e.g. "DANGCEM" and "Dangote"
-    for query in queries:
-        if len(items) >= 6:
-            break
-        try:
-            encoded = requests.utils.quote(query)
-            r = requests.get(
-                f"https://news.google.com/rss/search?q={encoded}+stock&hl=en&gl=US&ceid=US:en",
-                headers={"User-Agent": "StockNexus/1.0"}, timeout=8
-            )
-            if r.status_code == 200:
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(r.text)
-                for item in root.findall(".//item")[:4]:
-                    title = item.findtext("title", "")
-                    link  = item.findtext("link", "")
-                    src_el = item.find("source")
-                    source = src_el.text if src_el is not None else "Google News"
-                    pub    = item.findtext("pubDate", "")
-                    # Deduplicate by title
-                    if title and not any(x["title"] == title for x in items):
-                        items.append({"title": title, "source": source,
-                                      "url": link, "published": pub})
-        except Exception as e:
-            print(f"[NEWS] {stock_id} query={query}: {e}")
-    with _news_cache_lock:
-        _news_cache[key] = {"items": items[:6], "ts": now}
-    return items[:6]
-
-def score_news(items):
-    if not items: return 0.0, 0.5
-    total = 0.0
-    for item in items:
-        text = item.get("title","").lower()
-        score = sum(v for kw,v in STOCK_KEYWORDS.items() if kw in text)
-        item["score"] = round(score, 2)
-        total += score
-    avg = total / len(items)
-    bull = min(1.0, max(0.0, 0.5 + avg / 10))
-    return round(avg, 2), round(bull, 3)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHART IMAGE ANALYSIS  (Local Retrieval Model — no external API needed)
-# ══════════════════════════════════════════════════════════════════════════════
-# Run  python model/build_db.py  once to populate the database, then
-# chart analysis works fully offline using similarity search.
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# API ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.route("/")
-def index(): return render_template("index.html")
-
-@app.route("/favicon.ico")
-def favicon(): return "", 204
-
-@app.route("/api/seed")
-def seed():
-    return jsonify({
-        "eu_stocks": EU_STOCKS,
-        "asia_stocks": ASIA_STOCKS,
-        "us_stocks": US_STOCKS,
-        "market_eu": market_eu,
-        "market_as": market_as,
-        "market_us": market_us,
-    })
-
-@app.route("/api/stream")
-def stream():
-    q = queue.Queue(maxsize=500)
-    with subscribers_lock: subscribers.append(q)
-    def generate():
-        yield "data: " + json.dumps({"type":"snapshot","market_eu":market_eu,"market_as":market_as,"market_us":market_us}) + "\n\n"
-        try:
-            while True:
-                try:
-                    msg = q.get(timeout=20)
-                    if msg is None:  # shutdown sentinel
-                        return
-                    yield msg
-                except:
-                    yield ": keepalive\n\n"
-        except GeneratorExit: pass
-        finally:
-            with subscribers_lock:
-                try: subscribers.remove(q)
-                except: pass
-    return Response(stream_with_context(generate()), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-# ── Consensus engine ─────────────────────────────────────────────────────────
-def _build_consensus(rule_dir, rule_conf, bp, ml_pred):
-    """
-    Returns a consensus signal only when rule-based and ML agree on direction.
-    Inputs:
-        rule_dir  — "BULLISH" | "BEARISH" | "NEUTRAL"
-        rule_conf — int 0-100
-        bp        — bullish % from rule_based_signal
-        ml_pred   — dict from ml_predict()
-    Output:
-        signal    — "STRONG BUY"|"BUY"|"STRONG SELL"|"SELL"|"NO_CONSENSUS"
-        agreement — "FULL"|"RULE_ONLY"|"NONE"
-        tradeable — bool, True only when all agree with sufficient confidence
-    """
-    ml_src  = ml_pred.get("ml_source", "unavailable")
-    ml_dir  = ml_pred.get("ml_direction")
-    ml_prob = ml_pred.get("ml_prob_up")
-    ml_conf = ml_pred.get("ml_confidence", 0)
-    ml_sig  = ml_pred.get("ml_signal", "UNAVAILABLE")
-    ml_avail = ml_src not in ("unavailable", None) and ml_dir is not None
-
-    rule_up   = rule_dir == "BULLISH" and rule_conf >= 45
-    rule_down = rule_dir == "BEARISH" and rule_conf >= 45
-
-    # No ML available — rule only
-    ml_reason = ("ML models not trained — run model/train_model.py"
-                 if not models_ready()
-                 else "ML ran on available data")
-
-    if not ml_avail:
-        if rule_up:
-            sig = "STRONG BUY" if rule_conf >= 70 else "BUY"
-            return {"signal": sig, "agreement": "RULE_ONLY",
-                    "systems": {"rule": True, "xgb": None, "lstm": None},
-                    "confidence": rule_conf, "tradeable": rule_conf >= 60,
-                    "reason": f"Rule-based only — {ml_reason}"}
-        if rule_down:
-            sig = "STRONG SELL" if rule_conf >= 70 else "SELL"
-            return {"signal": sig, "agreement": "RULE_ONLY",
-                    "systems": {"rule": True, "xgb": None, "lstm": None},
-                    "confidence": rule_conf, "tradeable": rule_conf >= 60,
-                    "reason": f"Rule-based only — {ml_reason}"}
-        return {"signal": "NO_CONSENSUS", "agreement": "NONE",
-                "systems": {"rule": False, "xgb": None, "lstm": None},
-                "confidence": 0, "tradeable": False,
-                "reason": f"No clear rule-based signal — {ml_reason}"}
-
-    ml_up   = ml_dir == "UP"   and ml_prob is not None and ml_prob >= 0.54
-    ml_down = ml_dir == "DOWN" and ml_prob is not None and ml_prob <= 0.46
-
-    # Full consensus — all three agree
-    if rule_up and ml_up:
-        combined = int(rule_conf * 0.5 + ml_conf * 0.5)
-        sig = "STRONG BUY" if combined >= 70 and ml_prob >= 0.64 else "BUY"
-        return {"signal": sig, "agreement": "FULL",
-                "systems": {"rule": True, "xgb": True, "lstm": True},
-                "confidence": combined,
-                "ml_prob_up": round(ml_prob, 3),
-                "tradeable": combined >= 55,
-                "reason": (f"All systems bullish — Rule {rule_conf}% conf, "
-                           f"ML {ml_sig} ({ml_prob:.0%} prob up)")}
-
-    if rule_down and ml_down:
-        combined = int(rule_conf * 0.5 + ml_conf * 0.5)
-        sig = "STRONG SELL" if combined >= 70 and ml_prob <= 0.36 else "SELL"
-        return {"signal": sig, "agreement": "FULL",
-                "systems": {"rule": True, "xgb": True, "lstm": True},
-                "confidence": combined,
-                "ml_prob_up": round(ml_prob, 3),
-                "tradeable": combined >= 55,
-                "reason": (f"All systems bearish — Rule {rule_conf}% conf, "
-                           f"ML {ml_sig} ({ml_prob:.0%} prob up)")}
-
-    # Disagreement
-    rule_vote = "BULL" if rule_up else ("BEAR" if rule_down else "NEUTRAL")
-    ml_vote   = "BULL" if ml_dir == "UP" else ("BEAR" if ml_dir == "DOWN" else "NEUTRAL")
-    return {"signal": "NO_CONSENSUS", "agreement": "NONE",
-            "systems": {"rule": rule_vote, "xgb": ml_vote, "lstm": ml_vote},
-            "confidence": 0, "tradeable": False,
-            "reason": f"Systems disagree — Rule={rule_vote}, ML={ml_vote} ({ml_prob:.0%} prob up)" if ml_prob else "Systems disagree"}
-
-
-@app.route("/api/analyze", methods=["POST"])
-def analyze():
-    try:
-        data = request.get_json()
-        stock_id = data.get("stockId")
-        market_type = data.get("market", "us")  # "eu", "as", or "us"
-        stock_list = EU_STOCKS if market_type == "eu" else (ASIA_STOCKS if market_type == "as" else US_STOCKS)
-        stock_info = next((s for s in stock_list if s["id"] == stock_id), None)
-        if not stock_info:
-            return jsonify({"error": "Unknown stock"}), 400
-
-        mkt = market_eu if market_type == "eu" else (market_as if market_type == "as" else market_us)
-        state = mkt.get(stock_id, {})
-        price  = float(state.get("price", 100))
-        change = float(state.get("change", 0))
-        high   = float(state.get("high", price * 1.02))
-        low    = float(state.get("low", price * 0.98))
-        trade_size = float(data.get("tradeSize", 0))
-
-        # Fetch real OHLCV
-        _yf = stock_info.get("yf") or stock_id
-        df = fetch_ohlcv_stock(_yf)
-        indicators = None
-        if "data_src" not in dir():
-            data_src = "approximation"
-        if df is not None and len(df) >= 20:
-            try:
-                indicators = compute_indicators(df)
-                data_src = "real_candles"
-                price = indicators["price"] or price
-            except Exception as e:
-                print(f"[INDICATORS] {stock_id}: {e}")
-
-        if indicators is None:
-            # Fallback approximation
-            rng = high - low or price * 0.02
-            indicators = {
-                "rsi": min(98, max(2, 50 + change * 4.2)),
-                "rsi_7": min(98, max(2, 50 + change * 6)),
-                "macd": "BULLISH" if change > 0 else "BEARISH",
-                "macd_line": change * 0.01, "macd_hist": change * 0.001,
-                "bb_pct": ((price - low) / rng) * 100,
-                "bb_upper": high, "bb_lower": low,
-                "atr": rng / price * 100, "atr_raw": rng,
-                "ema9": price, "ema21": price, "ema50": price, "ema200": price,
-                "stoch_k": ((price - low) / rng) * 100,
-                "stoch_d": ((price - low) / rng) * 90,
-                "adx": min(80, max(10, abs(change)*8+20)),
-                "plus_di": 25.0, "minus_di": 25.0,
-                "vol_ratio": 1.0, "candle": "BULLISH BAR" if change > 0 else "BEARISH BAR",
-                "price": price,
-            }
-
-        direction, conf, bp = rule_based_signal(indicators, change)
-
-        # TP/SL from swing levels or ATR
-        atr_raw = indicators["atr_raw"]
-        if df is not None and len(df) >= 20:
-            swing_h, swing_l = swing_levels(df)
-        else:
-            swing_h, swing_l = [], []
-
-        def nearest_above(min_atr=1.0):
-            thr = price + atr_raw * min_atr
-            cands = [x for x in swing_h if x >= thr]
-            return cands[0] if cands else None
-        def nearest_below(min_atr=0.8):
-            thr = price - atr_raw * min_atr
-            cands = [x for x in swing_l if x <= thr]
-            return cands[0] if cands else None
-
-        m = atr_raw / price
-        if direction == "BULLISH":
-            t1   = round(nearest_above(1.0) or price*(1+m*1.5), 2)
-            t2   = round(nearest_above(2.0) or price*(1+m*3.0), 2)
-            # Ensure T2 is always further above price than T1
-            if t2 <= t1:
-                t2 = round(t1 + atr_raw * 1.5, 2)
-            stop = round((nearest_below(0.8) or price*(1-m*1.0)) * 0.9985, 2)
-            # Ensure SL is actually below price
-            if stop >= price:
-                stop = round(price * (1 - m * 1.0), 2)
-        elif direction == "BEARISH":
-            t1   = round(nearest_below(1.0) or price*(1-m*1.5), 2)
-            t2   = round(nearest_below(2.0) or price*(1-m*3.0), 2)
-            # Ensure T2 is always further below price than T1
-            if t2 >= t1:
-                t2 = round(t1 - atr_raw * 1.5, 2)
-            stop = round((nearest_above(0.8) or price*(1+m*1.0)) * 1.0015, 2)
-            # Ensure SL is actually above price
-            if stop <= price:
-                stop = round(price * (1 + m * 1.0), 2)
-        else:
-            t1   = round(price*(1+m*0.8), 2)
-            t2   = round(price*(1+m*1.5), 2)
-            stop = round(price*(1-m*1.2), 2)
-
-        rr = round(abs(t1 - price) / (abs(price - stop) + 1e-6), 2)
-
-        # News
-        news_items = []
-        try: news_items = fetch_stock_news(stock_id, stock_info["name"])
-        except: pass
-        news_score, news_bull = score_news(news_items)
-
-        # Trend label
-        adx = indicators["adx"]
-        trend_str = "STRONG" if adx > 50 else "MODERATE" if adx > 25 else "WEAK"
-        mkt_phase = "TRENDING" if adx > 35 else "RANGING"
-        currency = stock_info["currency"]
-        curr_sym = CURR_SYMBOLS.get(currency, "$")
-
-        # Position sizing
-        pos_sizing = None
-        if trade_size > 0:
-            sl_dist = abs(price - stop)
-            if sl_dist > 0:
-                units = trade_size / sl_dist
-                pos_sizing = {
-                    "tradeSize": trade_size, "units": round(units, 2),
-                    "slRisk": round(trade_size, 2),
-                    "t1Profit": round(abs(t1-price)*units, 2),
-                    "t2Profit": round(abs(t2-price)*units, 2),
-                    "slDist": round(sl_dist, 2),
-                    "rr1": round(abs(t1-price)/sl_dist, 2),
-                    "rr2": round(abs(t2-price)/sl_dist, 2),
-                }
-
-        ai_text = (
-            f"STOCK NEXUS [{stock_id}] ({direction}, {conf}% confidence) — "
-            f"{stock_info['name']} at {curr_sym}{price:,.2f} ({change:+.2f}%). "
-            f"[{data_src.replace('_',' ').upper()}] "
-            f"RSI(14) {indicators['rsi']:.1f} · RSI(7) {indicators['rsi_7']:.1f} — "
-            f"{'overbought' if indicators['rsi']>70 else 'oversold' if indicators['rsi']<30 else 'neutral'}. "
-            f"MACD {indicators['macd']} (hist {indicators['macd_hist']:+.4f}). "
-            f"Stoch K:{indicators['stoch_k']:.0f}/D:{indicators['stoch_d']:.0f}. "
-            f"ADX {adx:.0f} (+DI {indicators['plus_di']:.0f}/-DI {indicators['minus_di']:.0f}) — {trend_str} trend. "
-            f"BB {indicators['bb_pct']:.0f}%. Candle: {indicators['candle']}. Vol:{indicators['vol_ratio']:.2f}x. "
-            f"EMA9:{curr_sym}{indicators['ema9']:,.2f} EMA50:{curr_sym}{indicators['ema50']:,.2f}. "
-            f"Levels: TP1 {curr_sym}{t1:,.2f}, TP2 {curr_sym}{t2:,.2f}, SL {curr_sym}{stop:,.2f}. R/R: {rr}:1."
-        )
-
-        # ── ML Ensemble prediction ────────────────────────────────────────
-        ml_pred = ml_predict(df, price) if df is not None else ml_predict(None, price)
-
-        # ── Consensus engine — only fire when ALL systems agree ───────────
-        consensus = _build_consensus(direction, conf, bp, ml_pred)
-
-        return jsonify(_sanitize({
-            "stockId": stock_id,
-            "stockInfo": stock_info,
-            "price": price, "change": change,
-            "indicators": indicators,
-            "prediction": {
-                "dir": direction, "bullPct": bp, "bearPct": 100-bp,
-                "conf": conf, "targets": {"t1":t1,"t2":t2,"stop":stop}, "rr": rr,
-            },
-            "mlPrediction": ml_pred,
-            "consensus": consensus,
-            "posSizing": pos_sizing,
-            "news": news_items,
-            "newsScore": news_score,
-            "newsBull": news_bull,
-            "aiText": ai_text,
-            "trendStr": trend_str,
-            "marketPhase": mkt_phase,
-            "dataSource": data_src,
-            "market": market_type,
-        }))
-
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/predict", methods=["POST"])
-def predict():
-    """
-    Standalone ML prediction endpoint.
-    POST { "stockId": "ASML.AS" }
-    Returns all 4 ML outputs: direction, change%, signal, 5-day targets.
-    """
-    data     = request.get_json() or {}
-    stock_id = data.get("stockId", "").upper().strip()
-
-    stock_info = next((s for s in ALL_STOCKS if s["id"] == stock_id), None)
-    if not stock_info:
-        return jsonify({"error": f"Unknown stock: {stock_id}"}), 404
-
-    if not models_ready():
-        return jsonify({
-            "error": "ML models not trained yet. Run: python3 model/train_model.py",
-            "ml_source": "unavailable",
-        }), 503
-
-    # Fetch OHLCV
-    yf_ticker = stock_info.get("yf") or (stock_id + ".NG" if stock_info.get("currency") == "NGN" else stock_id)
-    df = fetch_ohlcv_stock(yf_ticker)
-
-    state = next((s for s in _stock_state if s["id"] == stock_id), {})
-    current_price = float(state.get("price", 0)) or (df["Close"].iloc[-1] if df is not None else 0)
-
-    result = ml_predict(df, current_price)
-    result["stockId"]    = stock_id
-    result["stockName"]  = stock_info["name"]
-    result["price"]      = current_price
-    result["currency"]   = stock_info["currency"]
-    return jsonify(_sanitize(result))
-
-
-@app.route("/api/predictor_status")
-def predictor_status_route():
-    """Return ML model readiness and accuracy stats."""
-    return jsonify(predictor_status())
-
-
-@app.route("/api/model_status")
-def model_status():
-    """Return the status of the local retrieval database."""
-    if not _retrieval_ok:
-        return jsonify({"ready": False, "reason": "retrieval module not loaded"})
-    ready = db_ready()
-    stats = db_stats() if ready else {"total": 0}
-    return jsonify({"ready": ready, "stats": stats})
-
-
-@app.route("/api/analyze_chart", methods=["POST"])
-def analyze_chart():
-    """Analyze an uploaded chart image using the local retrieval model."""
-    try:
-        if not _retrieval_ok:
-            return jsonify({
-                "success": False,
-                "error": "Retrieval module not loaded. Check model/retrieval.py."
-            }), 500
-
-        if not db_ready():
-            return jsonify({
-                "success": False,
-                "error": (
-                    "Chart database not built yet.\n\n"
-                    "Run this command once to generate it:\n"
-                    "  python model/build_db.py\n\n"
-                    "This pulls 120 days of history for all 40 stocks and takes ~5 minutes."
-                )
-            })
-
-        if "image" not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-
-        file        = request.files["image"]
-        image_bytes = file.read()
-
-        # Optionally pass the selected stock's current indicators for better matching
-        ind_json = request.form.get("indicators", "")
-        query_indicators = None
-        if ind_json:
-            try:
-                query_indicators = json.loads(ind_json)
-            except Exception:
-                pass
-
-        match = retrieve_top(image_bytes, query_indicators)
-        if not match:
-            return jsonify({
-                "success": False,
-                "error": "No similar chart found in database. Try rebuilding: python model/build_db.py"
-            })
-
-        if "error" in match:
-            return jsonify({"success": False, "error": match["error"]})
-
-        # Parse direction/confidence from the analysis text (already stored)
-        analysis  = match["analysis"]
-        direction = match["direction"]
-        conf      = match["confidence"]
-
-        return jsonify({
-            "success":    True,
-            "analysis":   analysis,
-            "signal":     direction,
-            "confidence": conf,
-            "model":      "local-retrieval",
-            "matched": {
-                "stock_id":   match["stock_id"],
-                "stock_name": match["stock_name"],
-                "date_end":   match["date_end"],
-                "img_sim":    match["img_sim"],
-                "combined_sim": match["combined_sim"],
-            },
-        })
-
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e), "success": False}), 500
-
-
-
-
-@app.route("/api/scan", methods=["POST"])
-def scan():
-    """Quick scan returning rule-based signals for all stocks."""
-    data = request.get_json() or {}
-    market_type = data.get("market", "both")
-    results = []
-
-    def scan_list(stock_list, mkt_data, mkt_type):
-        for s in stock_list:
-            state = mkt_data.get(s["id"], {})
-            price  = float(state.get("price", 100))
-            change = float(state.get("change", 0))
-            high   = float(state.get("high", price*1.02))
-            low    = float(state.get("low", price*0.98))
-            rng = high - low or price * 0.02
-            ind = {
-                "rsi": min(98, max(2, 50+change*4.2)),
-                "macd": "BULLISH" if change > 0 else "BEARISH",
-                "bb_pct": ((price-low)/rng)*100,
-                "stoch_k": ((price-low)/rng)*100,
-                "adx": min(80, max(10, abs(change)*8+20)),
-            }
-            direction, conf, bp = rule_based_signal(ind, change)
-            # Consensus filter — only include if rule-based signal is clear
-            # (ML not run here for speed; full ML consensus available via /api/analyze)
-            if direction != "NEUTRAL" and conf >= 55:
-                consensus = _build_consensus(direction, conf, bp,
-                                             {"ml_source": "unavailable", "ml_direction": None})
-                results.append({
-                    "id": s["id"], "name": s["name"], "sector": s["sector"],
-                    "market": mkt_type, "currency": s["currency"], "color": s["color"],
-                    "price": price, "change": change,
-                    "direction": direction, "conf": conf, "bullPct": bp,
-                    "rsi": round(ind["rsi"], 1), "adx": round(ind["adx"], 1),
-                    "consensusSignal": consensus["signal"],
-                })
-
-    if market_type in ("eu","both"): scan_list(EU_STOCKS,   market_eu, "eu")
-    if market_type in ("as","both"): scan_list(ASIA_STOCKS, market_as, "as")
-    if market_type in ("us","both"): scan_list(US_STOCKS,   market_us, "us")
-    results.sort(key=lambda x: x["conf"], reverse=True)
-    return jsonify({"results": results, "count": len(results)})
-
-
-def _shutdown(signum=None, frame=None):
-    print("\n[NEXUS] Shutting down cleanly...")
-    with subscribers_lock:
-        for q in list(subscribers):
-            try:
-                q.put(None)
-            except Exception:
-                pass
-        subscribers.clear()
-    print("[NEXUS] All SSE connections closed. Goodbye.")
-    import os
-    os._exit(0)
-
-import signal
-signal.signal(signal.SIGINT,  _shutdown)
-signal.signal(signal.SIGTERM, _shutdown)
-
-# ── Retraining scheduler — start once at module load time ────────────────────
-_scheduler = None
-try:
-    from retrain_scheduler import start_scheduler
-    _scheduler = start_scheduler()
-except ImportError:
-    print("[NEXUS] retrain_scheduler not found — auto-retraining disabled")
-except Exception as _se:
-    print(f"[NEXUS] Scheduler startup error: {_se}")
-
-if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5002))
-    print(f"STOCK NEXUS starting on http://0.0.0.0:{PORT}  [{_ASYNC_SERVER} server]")
-    print(f"[NEXUS] Markets: EU ({len(EU_STOCKS)} stocks), Asia ({len(ASIA_STOCKS)} stocks), US ({len(US_STOCKS)} stocks)")
-    print("[NEXUS] Press Ctrl+C to stop.")
-    try:
-        if _ASYNC_SERVER == "gevent":
-            from gevent.pywsgi import WSGIServer
-            from gevent import signal as gsignal
-            print("[SERVER] gevent WSGIServer — SSE-safe, no kqueue issues")
-            server = WSGIServer(("0.0.0.0", PORT), app)
-            gsignal.signal(signal.SIGINT,  _shutdown)
-            gsignal.signal(signal.SIGTERM, _shutdown)
-            server.serve_forever()
-        elif _ASYNC_SERVER == "eventlet":
-            import eventlet
-            import eventlet.wsgi
-            print("[SERVER] eventlet WSGIServer — SSE-safe, no kqueue issues")
-            sock = eventlet.listen(("0.0.0.0", PORT))
-            eventlet.wsgi.server(sock, app, log_output=False)
-        else:
-            print("[SERVER] Werkzeug dev server. Install gevent for better SSE support.")
-            app.run(debug=False, port=PORT, threaded=True, use_reloader=False)
-    except (KeyboardInterrupt, SystemExit):
-        _shutdown()
+function setWsStatus(s) {
+  const labels = { connecting:"CONNECTING", live:"LIVE · 15s", simulated:"SIMULATED", error:"RETRYING" };
+  document.querySelectorAll(".ws-badge").forEach(el => {
+    el.className = "ws-badge " + s;
+    el.innerHTML = `<span class="ws-dot"></span> ${labels[s] || s}`;
+  });
+}
+
+function handleTick(msg) {
+  const {id, market, price, change} = msg;
+  if (market === "eu" && marketEu[id]) {
+    const prev = marketEu[id].price;
+    marketEu[id].price  = price;
+    marketEu[id].change = change;
+    updateTopBarEu(id, price);
+    flashCell(id, price > prev ? "up" : price < prev ? "down" : "");
+  } else if (market === "as" && marketAs[id]) {
+    const prev = marketAs[id].price;
+    marketAs[id].price  = price;
+    marketAs[id].change = change;
+    flashCell(id, price > prev ? "up" : price < prev ? "down" : "");
+  } else if (market === "us" && marketUs[id]) {
+    const prev = marketUs[id].price;
+    marketUs[id].price  = price;
+    marketUs[id].change = change;
+    updateTopBarUs(id, price);
+    flashCell(id, price > prev ? "up" : price < prev ? "down" : "");
+  }
+  updatePredHeaderPrice(id, price, change);
+  if (currentPage === "dashboard") updateDashKPIs();
+  updateHeatCell(id, change);
+}
+
+function flashCell(id, dir) {
+  const el = document.getElementById("price-" + id);
+  if (!el || !dir) return;
+  el.classList.remove("tick-up","tick-down");
+  void el.offsetWidth;
+  el.classList.add(dir === "up" ? "tick-up" : "tick-down");
+}
+
+function updateTopBarEu(id, price) {
+  if (id === "ASML.AS") {
+    const el = document.getElementById("hdr-dangcem");
+    if (el) el.textContent = "€" + fpRaw(price);
+  }
+}
+function updateTopBarUs(id, price) {
+  if (id === "NVDA") {
+    const el = document.getElementById("hdr-nvda");
+    if (el) el.textContent = "$" + fpRaw(price);
+  }
+}
+
+function refreshAll() {
+  renderDashboard();
+  if (currentPage === "ngx") renderEuAsiaPage();
+  if (currentPage === "us")  renderUsPage();
+}
+
+// ── DASHBOARD ─────────────────────────────────────────────────
+function renderDashboard() {
+  updateDashKPIs();
+  renderDashMovers();
+  renderHeatmap();
+}
+
+function updateDashKPIs() {
+  const allEu   = euStocks.map(s => ({...s, ...marketEu[s.id]}));
+  const allAs   = asiaStocks.map(s => ({...s, ...marketAs[s.id]}));
+  const allUs   = usStocks.map(s => ({...s, ...marketUs[s.id]}));
+  const all = [...allEu, ...allAs, ...allUs];
+  const total = all.length;
+  const bulls = all.filter(s => (s.change||0) > 0).length;
+  const bears = all.filter(s => (s.change||0) < 0).length;
+  const flat  = total - bulls - bears;
+  const topGainer = [...all].sort((a,b)=>(b.change||0)-(a.change||0))[0];
+  const topLoser  = [...all].sort((a,b)=>(a.change||0)-(b.change||0))[0];
+  const spyData  = marketUs["SPY"];
+  const asmlData = marketEu["ASML.AS"];
+
+  document.getElementById("kpi-grid").innerHTML = `
+    <div class="kpi-card" style="--accent:var(--green)">
+      <div class="kpi-label">BULLISH STOCKS</div>
+      <div class="kpi-val" style="color:var(--green)">${bulls}</div>
+      <div class="kpi-sub">${bears} bearish · ${flat} flat</div>
+    </div>
+    <div class="kpi-card" style="--accent:var(--ng-green)">
+      <div class="kpi-label">ASML (EU)</div>
+      <div class="kpi-val" style="color:var(--ng-green)">€${fpRaw(asmlData?.price||0)}</div>
+      <div class="kpi-sub" style="color:${chColor(asmlData?.change||0)}">${fPct(asmlData?.change||0)}</div>
+    </div>
+    <div class="kpi-card" style="--accent:var(--us-blue)">
+      <div class="kpi-label">S&P 500 ETF (SPY)</div>
+      <div class="kpi-val" style="color:var(--us-blue)">$${fpRaw(spyData?.price||0)}</div>
+      <div class="kpi-sub" style="color:${chColor(spyData?.change||0)}">${fPct(spyData?.change||0)}</div>
+    </div>
+    <div class="kpi-card" style="--accent:var(--green)">
+      <div class="kpi-label">TOP GAINER</div>
+      <div class="kpi-val" style="color:var(--green)">${fPct(topGainer?.change||0)}</div>
+      <div class="kpi-sub">${topGainer?.id||"—"}</div>
+    </div>
+    <div class="kpi-card" style="--accent:var(--red)">
+      <div class="kpi-label">TOP LOSER</div>
+      <div class="kpi-val" style="color:var(--red)">${fPct(topLoser?.change||0)}</div>
+      <div class="kpi-sub">${topLoser?.id||"—"}</div>
+    </div>`;
+}
+
+function renderDashMovers() {
+  const allEuAs = [...euStocks, ...asiaStocks];
+  const euAsMkt = id => marketEu[id] || marketAs[id] || {};
+  const euAsSorted = [...allEuAs].sort((a,b)=>Math.abs(euAsMkt(b.id)?.change||0)-Math.abs(euAsMkt(a.id)?.change||0));
+  const usSorted   = [...usStocks].sort((a,b)=>Math.abs(marketUs[b.id]?.change||0)-Math.abs(marketUs[a.id]?.change||0));
+
+  const row = (s, mkt) => {
+    const d = mkt==="us" ? marketUs[s.id]||{} : euAsMkt(s.id);
+    const ch = d.change || 0;
+    const sym = currSym(s.currency || "USD");
+    return `<div class="stock-row" onclick="quickSelect('${s.id}','${mkt}')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="stock-icon" style="background:${s.color}22;color:${s.color}">${s.id.slice(0,4)}</div>
+        <div>
+          <div class="stock-name">${s.id}</div>
+          <div class="stock-full">${s.name}</div>
+        </div>
+      </div>
+      <div>
+        <div class="stock-price" style="color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
+        <div class="stock-change" style="color:${chColor(ch)}">${fPct(ch)}</div>
+      </div>
+    </div>`;
+  };
+
+  const euMkt = s => euStocks.find(x=>x.id===s.id) ? "eu" : "as";
+  document.getElementById("dash-ng-movers").innerHTML = euAsSorted.slice(0,5).map(s=>row(s, euMkt(s))).join("");
+  document.getElementById("dash-us-movers").innerHTML = usSorted.slice(0,5).map(s=>row(s,"us")).join("");
+
+  // leaders / laggards
+  const allWithMkt = [
+    ...euStocks.map(s=>({...s, mkt:"eu", change: marketEu[s.id]?.change||0, price: marketEu[s.id]?.price||0})),
+    ...asiaStocks.map(s=>({...s, mkt:"as", change: marketAs[s.id]?.change||0, price: marketAs[s.id]?.price||0})),
+    ...usStocks.map(s=>({...s, mkt:"us", change: marketUs[s.id]?.change||0, price: marketUs[s.id]?.price||0}))
+  ];
+  const leaders  = [...allWithMkt].sort((a,b)=>b.change-a.change).slice(0,5);
+  const laggards = [...allWithMkt].sort((a,b)=>a.change-b.change).slice(0,5);
+
+  const mktFlag = m => m==="eu"?"🌍":m==="as"?"🌏":"🇺🇸";
+  const glRow = s => {
+    const sym = currSym(s.currency || "USD");
+    return `<div class="stock-row" onclick="quickSelect('${s.id}','${s.mkt}')">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="stock-icon" style="background:${s.color}22;color:${s.color};width:24px;height:24px;font-size:7px">${s.id.slice(0,3)}</div>
+        <div>
+          <div style="font-size:11px;font-weight:700">${s.id}</div>
+          <div style="font-size:8px;color:var(--text3)">${mktFlag(s.mkt)} ${sym}${fpRaw(s.price)}</div>
+        </div>
+      </div>
+      <div style="font-family:var(--font-mono);font-size:11px;font-weight:700;color:${chColor(s.change)}">${fPct(s.change)}</div>
+    </div>`;
+  };
+  document.getElementById("dash-leaders").innerHTML  = leaders.map(glRow).join("");
+  document.getElementById("dash-laggards").innerHTML = laggards.map(glRow).join("");
+}
+
+function renderHeatmap() {
+  const all = [
+    ...euStocks.map(s=>({...s, mkt:"eu", change: marketEu[s.id]?.change||0})),
+    ...asiaStocks.map(s=>({...s, mkt:"as", change: marketAs[s.id]?.change||0})),
+    ...usStocks.map(s=>({...s, mkt:"us", change: marketUs[s.id]?.change||0}))
+  ];
+  document.getElementById("heatmap").innerHTML = all.map(s => {
+    const ch = s.change;
+    const intensity = Math.min(1, Math.abs(ch) / 5);
+    const bg = ch > 0
+      ? `rgba(0,200,83,${0.1+intensity*0.5})`
+      : ch < 0
+        ? `rgba(255,61,87,${0.1+intensity*0.5})`
+        : "var(--bg3)";
+    const tc = ch > 0 ? "#00e676" : ch < 0 ? "#ff3d57" : "var(--text3)";
+    return `<div class="heat-cell" style="background:${bg};color:${tc};border-color:${tc}33"
+      id="heat-${s.id}" onclick="quickSelect('${s.id}','${s.mkt}')">
+      <div style="font-weight:700;font-size:10px">${s.id}</div>
+      <div style="font-size:9px">${fPct(ch)}</div>
+    </div>`;
+  }).join("");
+}
+
+function updateHeatCell(id, change) {
+  const el = document.getElementById("heat-" + id);
+  if (!el) return;
+  const ch = change;
+  const intensity = Math.min(1, Math.abs(ch)/5);
+  const bg = ch>0?`rgba(0,200,83,${0.1+intensity*0.5})`:ch<0?`rgba(255,61,87,${0.1+intensity*0.5})`:"var(--bg3)";
+  const tc = ch>0?"#00e676":ch<0?"#ff3d57":"var(--text3)";
+  el.style.background = bg;
+  el.style.color = tc;
+  el.children[1].textContent = fPct(ch);
+}
+
+// ── EU/ASIA PAGE ──────────────────────────────────────────────
+function renderEuAsiaPage() {
+  const allEuAs = [...euStocks, ...asiaStocks];
+  const sectors = ["ALL", ...new Set(allEuAs.map(s=>s.sector))];
+  document.getElementById("ngx-sector-filters").innerHTML = sectors.map(s =>
+    `<button class="cat-btn${s===euSectorFilter?" active":""}" onclick="setEuSector('${s}')">${s}</button>`
+  ).join("");
+
+  const filtered = euSectorFilter === "ALL" ? allEuAs : allEuAs.filter(s=>s.sector===euSectorFilter);
+  document.getElementById("ngx-list").innerHTML = filtered.map((s,i) => {
+    const isEu = !!euStocks.find(x=>x.id===s.id);
+    const d = isEu ? (marketEu[s.id]||{}) : (marketAs[s.id]||{});
+    const mktType = isEu ? "eu" : "as";
+    const ch = d.change || 0;
+    const sym = currSym(s.currency || "EUR");
+    const flag = isEu ? "🌍" : "🌏";
+    return `<div class="table-row-ng" onclick="quickSelect('${s.id}','${mktType}')">
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${i+1}</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="stock-icon" style="background:${s.color}22;color:${s.color};width:28px;height:28px;font-size:7px">${s.id.slice(0,4)}</div>
+        <div>
+          <div style="font-family:var(--font-main);font-size:13px;font-weight:600">${flag} ${s.id}</div>
+          <div style="font-family:var(--font-mono);font-size:7px;color:var(--text3)">${s.name}</div>
+        </div>
+      </div>
+      <div id="price-${s.id}" style="font-family:var(--font-mono);font-size:12px;color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:${chColor(ch)}">${fPct(ch)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${sym}${fpRaw(d.high||0)} / ${sym}${fpRaw(d.low||0)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${fmtVol(d.vol||0)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text2)">${s.sector}</div>
+      <div>${quickSignal(ch)}</div>
+    </div>`;
+  }).join("");
+}
+function setEuSector(s) { euSectorFilter = s; renderEuAsiaPage(); }
+
+// ── US PAGE ────────────────────────────────────────────────────
+function renderUsPage() {
+  const sectors = ["ALL", ...new Set(usStocks.map(s=>s.sector))];
+  document.getElementById("us-sector-filters").innerHTML = sectors.map(s =>
+    `<button class="cat-btn${s===usSectorFilter?" active":""}" onclick="setUsSector('${s}')">${s}</button>`
+  ).join("");
+
+  const filtered = usSectorFilter === "ALL" ? usStocks : usStocks.filter(s=>s.sector===usSectorFilter);
+  document.getElementById("us-list").innerHTML = filtered.map((s,i) => {
+    const d = marketUs[s.id] || {};
+    const ch = d.change || 0;
+    return `<div class="table-row-ng" onclick="quickSelect('${s.id}','us')">
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${i+1}</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="stock-icon" style="background:${s.color}22;color:${s.color};width:28px;height:28px;font-size:7px">${s.id.slice(0,4)}</div>
+        <div>
+          <div style="font-family:var(--font-main);font-size:13px;font-weight:600">${s.id}</div>
+          <div style="font-family:var(--font-mono);font-size:7px;color:var(--text3)">${s.name}</div>
+        </div>
+      </div>
+      <div id="price-${s.id}" style="font-family:var(--font-mono);font-size:12px;color:${chColor(ch)}">$${fpRaw(d.price||0)}</div>
+      <div style="font-family:var(--font-mono);font-size:11px;color:${chColor(ch)}">${fPct(ch)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${d.mktcap||"—"}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3)">${fmtVol(d.vol||0)}</div>
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text2)">${s.sector}</div>
+      <div>${quickSignal(ch)}</div>
+    </div>`;
+  }).join("");
+}
+function setUsSector(s) { usSectorFilter = s; renderUsPage(); }
+
+function fmtVol(v) {
+  if (!v) return "—";
+  if (v >= 1e9) return (v/1e9).toFixed(1)+"B";
+  if (v >= 1e6) return (v/1e6).toFixed(1)+"M";
+  if (v >= 1e3) return (v/1e3).toFixed(1)+"K";
+  return v;
+}
+
+// ── PREDICTOR ─────────────────────────────────────────────────
+function setPredMarket(mkt) {
+  predMarket = mkt;
+  document.querySelectorAll(".mkt-btn").forEach(b => {
+    b.classList.toggle("active", b.dataset.mkt === mkt);
+  });
+  selectedStock = null;
+  renderPredSidebar();
+  document.getElementById("pred-header").innerHTML = `<div class="empty-pred-header">SELECT A STOCK TO ANALYZE</div>`;
+  document.getElementById("pred-content").innerHTML = `<div class="empty-state"><div class="empty-title">STOCK NEXUS</div><div class="empty-sub">SELECT A STOCK AND CLICK ANALYZE<br/>FOR AI-POWERED EQUITY PREDICTIONS</div></div>`;
+}
+
+function getMktList(mkt)  { return mkt==="eu"?euStocks:mkt==="as"?asiaStocks:usStocks; }
+function getMktData(mkt)  { return mkt==="eu"?marketEu:mkt==="as"?marketAs:marketUs; }
+function getMktFlag(mkt)  { return mkt==="eu"?"🌍 EU":mkt==="as"?"🌏 ASIA":"🇺🇸 US"; }
+
+function renderPredSidebar() {
+  const list = getMktList(predMarket);
+  const mkt  = getMktData(predMarket);
+  document.getElementById("pred-stocklist").innerHTML = list.map(s => {
+    const d   = mkt[s.id] || {};
+    const ch  = d.change || 0;
+    const sym = currSym(s.currency || "USD");
+    return `<div class="pred-coin-item${selectedStock===s.id?" active":""}"
+      id="pred-item-${s.id}" onclick="selectStock('${s.id}','${predMarket}')">
+      <div class="pred-coin-icon" style="background:${s.color}22;color:${s.color}">${s.id.slice(0,4)}</div>
+      <div>
+        <div class="pred-coin-name">${s.id}</div>
+        <div class="pred-coin-full">${s.name.slice(0,22)}</div>
+      </div>
+      <div style="text-align:right;margin-left:auto">
+        <div class="pred-coin-price" style="color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
+        <div class="pred-coin-ch" style="color:${chColor(ch)}">${fPct(ch)}</div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function filterPredStocks(q) {
+  const list = getMktList(predMarket);
+  const mkt  = getMktData(predMarket);
+  const filtered = q ? list.filter(s => s.id.toLowerCase().includes(q.toLowerCase()) || s.name.toLowerCase().includes(q.toLowerCase())) : list;
+  document.getElementById("pred-stocklist").innerHTML = filtered.map(s => {
+    const d   = mkt[s.id] || {};
+    const ch  = d.change || 0;
+    const sym = currSym(s.currency || "USD");
+    return `<div class="pred-coin-item${selectedStock===s.id?" active":""}"
+      onclick="selectStock('${s.id}','${predMarket}')">
+      <div class="pred-coin-icon" style="background:${s.color}22;color:${s.color}">${s.id.slice(0,4)}</div>
+      <div>
+        <div class="pred-coin-name">${s.id}</div>
+        <div class="pred-coin-full">${s.name.slice(0,22)}</div>
+      </div>
+      <div style="text-align:right;margin-left:auto">
+        <div class="pred-coin-price" style="color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
+        <div class="pred-coin-ch" style="color:${chColor(ch)}">${fPct(ch)}</div>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function selectStock(id, mkt) {
+  selectedStock = id;
+  predMarket = mkt;
+  const list = getMktList(mkt);
+  const mkd  = getMktData(mkt);
+  const info = list.find(s => s.id === id);
+  const d    = mkd[id] || {};
+  const ch   = d.change || 0;
+  const sym  = currSym(info?.currency || "USD");
+
+  document.querySelectorAll(".pred-coin-item").forEach(el => el.classList.remove("active"));
+  const el = document.getElementById("pred-item-" + id);
+  if (el) el.classList.add("active");
+
+  document.getElementById("pred-header").innerHTML = `
+    <div class="pred-stock-header">
+      <div class="pred-stock-icon" style="background:${info?.color||"#333"}22;color:${info?.color||"#fff"}">${id.slice(0,4)}</div>
+      <div>
+        <div class="pred-stock-id">${id}</div>
+        <div class="pred-stock-name">${info?.name||""} · ${getMktFlag(mkt)}</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div class="pred-stock-price" style="color:${chColor(ch)}">${sym}${fpRaw(d.price||0)}</div>
+        <div class="pred-stock-ch" style="color:${chColor(ch)}">${fPct(ch)}</div>
+      </div>
+    </div>`;
+
+  document.getElementById("analyze-btn").textContent = `ANALYZE ${id}`;
+
+  // Navigate to predictor if not already
+  if (currentPage !== "predictor") {
+    document.querySelectorAll(".nav-item").forEach(b => {
+      b.classList.toggle("active", b.dataset.page === "predictor");
+    });
+    document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+    document.getElementById("page-predictor").classList.add("active");
+    currentPage = "predictor";
+  }
+}
+
+function quickSelect(id, mkt) {
+  setPredMarket(mkt);
+  selectStock(id, mkt);
+}
+
+function updatePredHeaderPrice(id, price, change) {
+  if (id !== selectedStock) return;
+  const list = getMktList(predMarket);
+  const info = list.find(s => s.id === id);
+  const sym = currSym(info?.currency || "USD");
+  const prEl = document.querySelector(".pred-stock-price");
+  const chEl = document.querySelector(".pred-stock-ch");
+  if (prEl) { prEl.textContent = sym + fpRaw(price); prEl.style.color = chColor(change); }
+  if (chEl) { chEl.textContent = fPct(change); chEl.style.color = chColor(change); }
+}
+
+// ── ANALYSIS ──────────────────────────────────────────────────
+async function runAnalysis() {
+  if (!selectedStock) {
+    alert("Select a stock first.");
+    return;
+  }
+  const btn = document.getElementById("analyze-btn");
+  btn.disabled = true; btn.textContent = "ANALYZING...";
+
+  const balance  = parseFloat(document.getElementById("pred-balance").value) || 0;
+  const riskPct  = parseFloat(document.getElementById("pred-risk-pct").value) || 1;
+  const tradeSize = balance > 0 ? balance * riskPct / 100 : 0;
+
+  document.getElementById("pred-content").innerHTML =
+    `<div class="loading"><div class="spin"></div> FETCHING REAL-TIME DATA & COMPUTING INDICATORS...</div>`;
+
+  try {
+    const res = await fetch("/api/analyze", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ stockId: selectedStock, market: predMarket, tradeSize })
+    });
+    const data = await res.json();
+    renderAnalysisResult(data, balance, riskPct);
+  } catch(e) {
+    document.getElementById("pred-content").innerHTML =
+      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${e.message}</div>`;
+  }
+  btn.disabled = false; btn.textContent = "ANALYZE " + selectedStock;
+}
+
+function renderAnalysisResult(d, balance, riskPct) {
+  if (d.error) {
+    document.getElementById("pred-content").innerHTML =
+      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${d.error}</div>`;
+    return;
+  }
+
+  const dir   = d.prediction?.dir || "NEUTRAL";
+  const conf  = d.prediction?.conf || 0;
+  const bp    = d.prediction?.bullPct || 50;
+  const t1    = d.prediction?.targets?.t1;
+  const t2    = d.prediction?.targets?.t2;
+  const stop  = d.prediction?.targets?.stop;
+  const rr    = d.prediction?.rr;
+  const ind   = d.indicators || {};
+  const sym   = currSym(d.stockInfo?.currency || "USD");
+  const price = d.price || 0;
+  const change= d.change || 0;
+  const color = d.stockInfo?.color || "#4A9EFF";
+  const sigCls = dir==="BULLISH"?"bull":dir==="BEARISH"?"bear":"neut";
+  const sigColor = dirColor(dir);
+
+  let posHtml = "";
+  if (d.posSizing) {
+    const ps = d.posSizing;
+    posHtml = `
+    <div style="margin-bottom:14px">
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:8px">POSITION SIZING</div>
+      <div class="pos-sizing-grid">
+        <div class="analysis-card"><div class="analysis-label">RISK AMOUNT</div><div class="analysis-val" style="color:var(--red);font-size:18px">${sym}${fpRaw(ps.tradeSize)}</div></div>
+        <div class="analysis-card"><div class="analysis-label">UNITS</div><div class="analysis-val" style="font-size:18px">${ps.units.toLocaleString("en",{maximumFractionDigits:0})}</div></div>
+        <div class="analysis-card"><div class="analysis-label">TP1 PROFIT</div><div class="analysis-val" style="color:var(--green);font-size:18px">${sym}${fpRaw(ps.t1Profit)}</div></div>
+        <div class="analysis-card"><div class="analysis-label">TP2 PROFIT</div><div class="analysis-val" style="color:var(--green);font-size:18px">${sym}${fpRaw(ps.t2Profit)}</div></div>
+        <div class="analysis-card"><div class="analysis-label">R/R (TP1)</div><div class="analysis-val" style="color:var(--cyan);font-size:18px">${ps.rr1}:1</div></div>
+        <div class="analysis-card"><div class="analysis-label">R/R (TP2)</div><div class="analysis-val" style="color:var(--cyan);font-size:18px">${ps.rr2}:1</div></div>
+      </div>
+    </div>`;
+  }
+
+  let newsHtml = "";
+  if (d.news && d.news.length > 0) {
+    newsHtml = `
+    <div style="margin-bottom:14px">
+      <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:8px">
+        MARKET NEWS · SENTIMENT: 
+        <span style="color:${d.newsBull>0.55?"var(--green)":d.newsBull<0.45?"var(--red)":"var(--amber)"}">${d.newsBull>0.55?"BULLISH":d.newsBull<0.45?"BEARISH":"NEUTRAL"}</span>
+      </div>
+      <div class="news-list">
+        ${d.news.slice(0,4).map(n=>`
+          <div class="news-item" onclick="window.open('${n.url||"#"}','_blank')">
+            <div class="news-title">${n.title||"—"}</div>
+            <div class="news-meta">${n.source||""} · ${n.score!=null?`SCORE: ${n.score>0?"+":""}${n.score}`:""}</div>
+          </div>`).join("")}
+      </div>
+    </div>`;
+  }
+
+  document.getElementById("pred-content").innerHTML = `
+  <div class="fadeIn">
+    <!-- SIGNAL BOX -->
+    <div class="signal-box ${sigCls}" style="margin-bottom:16px">
+      <div class="signal-dir" style="color:${sigColor}">${dir}</div>
+      <div class="signal-conf" style="color:${sigColor}">${conf}% CONFIDENCE · ${d.marketPhase||""}</div>
+      <div class="conf-bar-wrap" style="max-width:300px;margin:8px auto 0">
+        <div class="conf-bar" style="width:${conf}%;background:${sigColor}"></div>
+      </div>
+      <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3);margin-top:6px">
+        ${d.dataSource==="real_candles"?"✓ REAL CANDLE DATA":"⚡ APPROXIMATION"} · 
+        BULL ${bp}% / BEAR ${100-bp}%
+      </div>
+    </div>
+
+    <!-- CONSENSUS SIGNAL -->
+    ${(()=>{
+      const cs = d.consensus;
+      if (!cs) return "";
+      const isFull      = cs.agreement === "FULL";
+      const isRuleOnly  = cs.agreement === "RULE_ONLY";
+      const noConsensus = cs.signal === "NO_CONSENSUS";
+      const isBuy  = cs.signal && cs.signal.includes("BUY");
+      const isSell = cs.signal && cs.signal.includes("SELL");
+
+      const csColor  = isFull && isBuy  ? "var(--green)"
+                     : isFull && isSell ? "var(--red)"
+                     : isRuleOnly       ? "var(--amber)"
+                     : "var(--text3)";
+      const csBg     = isFull && isBuy  ? "rgba(0,255,136,0.06)"
+                     : isFull && isSell ? "rgba(255,61,87,0.06)"
+                     : isRuleOnly       ? "rgba(255,170,0,0.06)"
+                     : "rgba(255,255,255,0.02)";
+      const csBorder = isFull && isBuy  ? "var(--green)"
+                     : isFull && isSell ? "var(--red)"
+                     : isRuleOnly       ? "var(--amber)"
+                     : "var(--border)";
+      const icon = isFull && isBuy ? "\u25b2" : isFull && isSell ? "\u25bc" : noConsensus ? "\u2014" : "\u25c6";
+
+      const sys  = cs.systems || {};
+      function mkDot(val, label) {
+        const agree = val === true || (isBuy && val === "BULL") || (isSell && val === "BEAR");
+        const clash = val === false || (isBuy && val === "BEAR") || (isSell && val === "BULL");
+        const c2    = agree ? "var(--green)" : clash ? "var(--red)" : "var(--text3)";
+        const mark  = val === null || val === undefined ? "—" : agree ? "\u2713" : clash ? "\u2717" : val;
+        const suffix = val === null || val === undefined ? " (no data for this stock)" : "";
+        return '<span style="font-family:var(--font-mono);font-size:9px;color:' + c2 + ';margin-right:12px">' + mark + ' ' + label + suffix + '</span>';
+      }
+
+      let confBar = "";
+      if (isFull) {
+        confBar = '<div style="margin:8px 0 0">'
+          + '<div style="display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:8px;color:var(--text3);margin-bottom:4px">'
+          + '<span>COMBINED CONFIDENCE</span><span>' + cs.confidence + '%</span></div>'
+          + '<div style="height:3px;background:var(--border);border-radius:2px">'
+          + '<div style="height:3px;width:' + cs.confidence + '%;background:' + csColor + ';border-radius:2px;transition:width .4s"></div>'
+          + '</div></div>';
+      }
+
+      let probLine = "";
+      if (cs.ml_prob_up != null) {
+        probLine = '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-top:6px">'
+          + 'ML PROB UP: <span style="color:' + csColor + '">' + (cs.ml_prob_up * 100).toFixed(1) + '%</span></div>';
+      }
+
+      let badges = "";
+      if (isFull)       badges = '<span style="font-family:var(--font-mono);font-size:9px;color:var(--green);margin-left:10px;background:rgba(0,255,136,0.1);padding:2px 8px;border-radius:3px">ALL SYSTEMS AGREE</span>';
+      else if (isRuleOnly)   badges = '<span style="font-family:var(--font-mono);font-size:9px;color:var(--amber);margin-left:10px;background:rgba(255,170,0,0.1);padding:2px 8px;border-radius:3px">RULE-BASED ONLY</span>';
+      else if (noConsensus)  badges = '<span style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-left:10px;background:rgba(255,255,255,0.05);padding:2px 8px;border-radius:3px">WAIT \u2014 MIXED SIGNALS</span>';
+
+      const tradeColor = cs.tradeable ? "var(--green)" : "var(--text3)";
+      const tradeBg    = cs.tradeable ? "rgba(0,255,136,0.1)" : "rgba(255,255,255,0.04)";
+      const tradeBorder= cs.tradeable ? "var(--green)" : "var(--border)";
+      const tradeLabel = cs.tradeable ? "\u2713 TRADEABLE" : "\u2717 NOT TRADEABLE";
+
+      return '<div style="border:1px solid ' + csBorder + '44;background:' + csBg + ';border-radius:8px;padding:14px 16px;margin-bottom:16px">'
+        + '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:10px">CONSENSUS SIGNAL</div>'
+        + '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
+        + '<div>'
+        + '<span style="font-family:var(--font-mono);font-size:22px;font-weight:700;color:' + csColor + ';letter-spacing:1px">' + icon + ' ' + cs.signal + '</span>'
+        + '<br>'
+        + badges
+        + '</div>'
+        + '<div style="font-family:var(--font-mono);font-size:9px;color:' + tradeColor + ';background:' + tradeBg + ';padding:4px 10px;border-radius:4px;border:1px solid ' + tradeBorder + '">' + tradeLabel + '</div>'
+        + '</div>'
+        + '<div style="margin-top:10px">' + mkDot(sys.rule,"RULE-BASED") + mkDot(sys.xgb,"XGBOOST") + mkDot(sys.lstm,"LSTM") + '</div>'
+        + '<div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-top:8px;line-height:1.5">' + (cs.reason||"") + '</div>'
+        + confBar + probLine
+        + '</div>';
+    })()}
+    <!-- OVERVIEW CARDS -->
+    <div class="analysis-top" style="margin-bottom:14px">
+      <div class="analysis-card">
+        <div class="analysis-label">CURRENT PRICE</div>
+        <div class="analysis-val" style="color:${color}">${sym}${fpRaw(price)}</div>
+        <div class="analysis-sub" style="color:${chColor(change)}">${fPct(change)} today</div>
+      </div>
+      <div class="analysis-card">
+        <div class="analysis-label">MARKET CAP</div>
+        <div class="analysis-val" style="font-size:18px">${getMktData(predMarket)[selectedStock]?.mktcap||"—"}</div>
+        <div class="analysis-sub">${d.stockInfo?.sector||""}</div>
+      </div>
+      <div class="analysis-card">
+        <div class="analysis-label">TREND STRENGTH</div>
+        <div class="analysis-val" style="font-size:18px">${d.trendStr||"—"}</div>
+        <div class="analysis-sub">ADX ${ind.adx||"—"}</div>
+      </div>
+    </div>
+
+    <!-- KEY LEVELS -->
+    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:8px">KEY LEVELS · R/R ${rr||"—"}:1</div>
+    <div class="levels-grid" style="margin-bottom:14px">
+      <div class="level-card" style="border-color:var(--green)44">
+        <div class="level-label" style="color:var(--green)">TARGET 1</div>
+        <div class="level-price" style="color:var(--green)">${sym}${fpRaw(t1)}</div>
+        <div class="level-dist">+${fpRaw(Math.abs((t1||price)-price))} (${(Math.abs(((t1||price)-price)/price)*100).toFixed(2)}%)</div>
+      </div>
+      <div class="level-card" style="border-color:var(--cyan)44">
+        <div class="level-label" style="color:var(--cyan)">TARGET 2</div>
+        <div class="level-price" style="color:var(--cyan)">${sym}${fpRaw(t2)}</div>
+        <div class="level-dist">+${fpRaw(Math.abs((t2||price)-price))} (${(Math.abs(((t2||price)-price)/price)*100).toFixed(2)}%)</div>
+      </div>
+      <div class="level-card" style="border-color:var(--red)44">
+        <div class="level-label" style="color:var(--red)">STOP LOSS</div>
+        <div class="level-price" style="color:var(--red)">${sym}${fpRaw(stop)}</div>
+        <div class="level-dist">-${fpRaw(Math.abs((stop||price)-price))} (${(Math.abs(((stop||price)-price)/price)*100).toFixed(2)}%)</div>
+      </div>
+    </div>
+
+    <!-- INDICATORS -->
+    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:8px">TECHNICAL INDICATORS</div>
+    <div class="ind-grid" style="margin-bottom:14px">
+      <div class="ind-card">
+        <div class="ind-label">RSI 14</div>
+        <div class="ind-val" style="color:${ind.rsi>70?"var(--red)":ind.rsi<30?"var(--green)":"var(--text)"}">${ind.rsi||"—"}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">RSI 7</div>
+        <div class="ind-val" style="color:${ind.rsi_7>70?"var(--red)":ind.rsi_7<30?"var(--green)":"var(--text)"}">${ind.rsi_7||"—"}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">MACD</div>
+        <div class="ind-val" style="color:${ind.macd==="BULLISH"?"var(--green)":"var(--red)"}">${ind.macd||"—"}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">BB POSITION</div>
+        <div class="ind-val" style="color:${ind.bb_pct>80?"var(--red)":ind.bb_pct<20?"var(--green)":"var(--text)"}">${ind.bb_pct?.toFixed(1)||"—"}%</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">STOCH K/D</div>
+        <div class="ind-val">${ind.stoch_k?.toFixed(0)||"—"}/${ind.stoch_d?.toFixed(0)||"—"}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">ADX</div>
+        <div class="ind-val" style="color:${ind.adx>50?"var(--green)":ind.adx>25?"var(--amber)":"var(--text3)"}">${ind.adx?.toFixed(1)||"—"}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">EMA 9</div>
+        <div class="ind-val">${sym}${fpRaw(ind.ema9)}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">EMA 50</div>
+        <div class="ind-val">${sym}${fpRaw(ind.ema50)}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">EMA 200</div>
+        <div class="ind-val">${sym}${fpRaw(ind.ema200)}</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">ATR</div>
+        <div class="ind-val">${ind.atr?.toFixed(3)||"—"}%</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">VOLUME RATIO</div>
+        <div class="ind-val" style="color:${ind.vol_ratio>2?"var(--amber)":"var(--text)"}">${ind.vol_ratio?.toFixed(2)||"—"}x</div>
+      </div>
+      <div class="ind-card">
+        <div class="ind-label">CANDLE</div>
+        <div class="ind-val" style="font-size:10px">${ind.candle||"—"}</div>
+      </div>
+    </div>
+
+    ${posHtml}
+
+    <!-- AI TEXT -->
+    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:8px">AI ANALYSIS SUMMARY</div>
+    <div class="ai-text-box">${d.aiText||""}</div>
+
+    ${newsHtml}
+
+    <!-- QUICK ADD TO JOURNAL -->
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn-secondary" onclick="prefillJournal('${d.stockId}','${predMarket}','LONG','${price}','${stop}','${t1}','${t2}')">+ ADD LONG TO JOURNAL</button>
+      <button class="btn-secondary" onclick="prefillJournal('${d.stockId}','${predMarket}','SHORT','${price}','${stop}','${t1}','${t2}')">+ ADD SHORT TO JOURNAL</button>
+    </div>
+  </div>`;
+}
+
+// ── SCANNER ────────────────────────────────────────────────────
+function setScanMarket(mkt, btn) {
+  scanMarket = mkt;
+  document.querySelectorAll(".cat-filters .cat-btn").forEach(b => b.classList.remove("active"));
+  if (btn) btn.classList.add("active");
+}
+
+async function runScan() {
+  const btn = document.getElementById("scan-btn");
+  btn.disabled = true; btn.textContent = "SCANNING...";
+  document.getElementById("scanner-content").innerHTML =
+    `<div class="loading"><div class="spin"></div> SCANNING ALL STOCKS...</div>`;
+
+  try {
+    const res  = await fetch("/api/scan", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ market: scanMarket })
+    });
+    const data = await res.json();
+    renderScanResults(data);
+  } catch(e) {
+    document.getElementById("scanner-content").innerHTML =
+      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${e.message}</div>`;
+  }
+  btn.disabled = false; btn.textContent = "⚡ RUN SCAN";
+}
+
+function renderScanResults(data) {
+  const results = data.results || [];
+  if (!results.length) {
+    document.getElementById("scanner-content").innerHTML =
+      `<div class="empty-state"><div class="empty-title">NO SIGNALS</div><div class="empty-sub">NO HIGH-CONFIDENCE SETUPS FOUND</div></div>`;
+    return;
+  }
+  const bulls = results.filter(r=>r.direction==="BULLISH");
+  const bears = results.filter(r=>r.direction==="BEARISH");
+
+  document.getElementById("scanner-content").innerHTML = `
+    <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px;margin-bottom:16px">
+      FOUND ${results.length} SIGNALS · 
+      <span style="color:var(--green)">${bulls.length} BULLISH</span> · 
+      <span style="color:var(--red)">${bears.length} BEARISH</span>
+    </div>
+    <div class="scanner-grid">
+      ${results.map(r => {
+        const sigColor = dirColor(r.direction);
+        const sym = currSym(r.currency || "USD");
+        const mktLabel = r.market==="eu"?"🌍 EU":r.market==="as"?"🌏 ASIA":"🇺🇸 US";
+        return `<div class="scan-card ${r.direction==="BULLISH"?"bull":"bear"}" onclick="quickSelect('${r.id}','${r.market}')">
+          <div class="scan-header">
+            <div>
+              <div class="scan-name" style="color:${r.color}">${r.id}</div>
+              <div class="scan-mkt">${mktLabel} · ${r.sector}</div>
+            </div>
+            <div>
+              <div class="scan-conf" style="color:${sigColor}">${r.conf}%</div>
+              <div style="font-family:var(--font-mono);font-size:8px;color:${sigColor}">${r.direction}</div>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+            <div style="font-family:var(--font-title);font-size:18px;color:${chColor(r.change)}">${sym}${fpRaw(r.price)}</div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:${chColor(r.change)}">${fPct(r.change)}</div>
+          </div>
+          <div class="conf-bar-wrap"><div class="conf-bar" style="width:${r.conf}%;background:${sigColor}"></div></div>
+          <div class="scan-metrics" style="margin-top:6px">
+            <div class="scan-metric">RSI <span>${r.rsi}</span></div>
+            <div class="scan-metric">ADX <span>${r.adx}</span></div>
+            <div class="scan-metric">BULL <span>${r.bullPct}%</span></div>
+          </div>
+          <div style="font-family:var(--font-mono);font-size:8px;color:var(--text4);margin-top:6px">Click to analyze →</div>
+        </div>`;
+      }).join("")}
+    </div>`;
+}
+
+// ── CHART VISION AI ────────────────────────────────────────────
+let chartFile = null;
+
+function handleChartUpload(input) {
+  if (input.files && input.files[0]) handleChartFile(input.files[0]);
+}
+
+function handleChartFile(file) {
+  chartFile = file;
+  const reader = new FileReader();
+  reader.onload = e => {
+    document.getElementById("upload-zone").style.display = "none";
+    document.getElementById("chart-preview-wrap").style.display = "block";
+    document.getElementById("chart-preview").src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function clearChartUpload() {
+  chartFile = null;
+  document.getElementById("upload-zone").style.display = "block";
+  document.getElementById("chart-preview-wrap").style.display = "none";
+  document.getElementById("chart-preview").src = "";
+  document.getElementById("chart-file-input").value = "";
+  document.getElementById("chart-analyze-status").textContent = "";
+}
+
+async function runChartAnalysis() {
+  if (!chartFile) {
+    document.getElementById("chart-analyze-status").textContent = "⚠ Please upload a chart image first.";
+    return;
+  }
+
+  const btn = document.getElementById("chart-analyze-btn");
+  btn.disabled = true; btn.textContent = "🔍 SEARCHING...";
+  document.getElementById("chart-analyze-status").textContent = "Searching database for similar chart...";
+  document.getElementById("chartai-empty").style.display = "none";
+  document.getElementById("chartai-result").style.display = "none";
+  document.getElementById("chartai-result-panel").innerHTML = `<div class="loading"><div class="spin"></div> MATCHING YOUR CHART AGAINST HISTORICAL DATABASE...</div>`;
+
+  const formData = new FormData();
+  formData.append("image", chartFile);
+
+  // Pass current indicators if a stock is selected in the analysis panel
+  if (selectedStock) {
+    const mkt = getMktData(predMarket);
+    const state = mkt[selectedStock] || {};
+    // Send whatever indicator data we have for better matching
+    const indProxy = {
+      rsi: Math.min(98, Math.max(2, 50 + (state.change||0) * 4.2)),
+      bb_pct: 50,
+      stoch_k: 50,
+      adx: Math.min(80, Math.max(10, Math.abs(state.change||0)*8+20)),
+      vol_ratio: 1.0,
+      atr: 0.5,
+    };
+    formData.append("indicators", JSON.stringify(indProxy));
+  }
+
+  try {
+    const res  = await fetch("/api/analyze_chart", { method: "POST", body: formData });
+    const data = await res.json();
+    renderChartResult(data);
+    document.getElementById("chart-analyze-status").textContent = data.success ? "✓ Match found" : "⚠ No match";
+  } catch(e) {
+    document.getElementById("chartai-result-panel").innerHTML =
+      `<div style="color:var(--red);font-family:var(--font-mono);font-size:10px;padding:20px">ERROR: ${e.message}</div>`;
+    document.getElementById("chart-analyze-status").textContent = "⚠ Error during analysis";
+  } finally {
+    btn.disabled = false; btn.textContent = "👁 ANALYZE CHART WITH AI";
+  }
+}
+
+function renderChartResult(data) {
+  if (!data.success) {
+    const isNotBuilt = (data.error||"").includes("not built") || (data.error||"").includes("build_db");
+    document.getElementById("chartai-result-panel").innerHTML = `
+      <div style="padding:20px">
+        <div style="color:var(--red);font-family:var(--font-mono);font-size:10px;margin-bottom:12px">⚠ ANALYSIS FAILED</div>
+        <div style="color:var(--text2);font-family:var(--font-mono);font-size:10px;white-space:pre-wrap">${data.error||"Unknown error"}</div>
+        ${isNotBuilt ? `
+        <div style="color:var(--amber);font-family:var(--font-mono);font-size:9px;margin-top:16px;line-height:2;border:1px solid var(--amber);padding:10px;border-radius:4px">
+          ▶ TO BUILD THE DATABASE, run this once in your terminal:<br/>
+          <code style="color:var(--cyan)">cd stock-nexus && python model/build_db.py</code><br/>
+          Takes ~5 minutes. After that, chart analysis works fully offline.
+        </div>` : ""}
+      </div>`;
+    return;
+  }
+
+  const sig  = data.signal || "NEUTRAL";
+  const conf = data.confidence || 50;
+  const sigColor = dirColor(sig);
+  const sigCls = sig==="BULLISH"?"bull":sig==="BEARISH"?"bear":"neut";
+
+  // Convert markdown-like text to HTML
+  let html = data.analysis || "";
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/(<li>.*<\/li>)/gs, m => `<ul>${m}</ul>`);
+  html = html.replace(/\n\n/g, '</p><p>');
+  html = `<p>${html}</p>`;
+
+  // Match metadata
+  const m = data.matched || {};
+  const matchBadge = m.stock_id ? `
+    <div style="font-family:var(--font-mono);font-size:8px;color:var(--text3);margin-top:6px;display:flex;gap:12px;flex-wrap:wrap">
+      <span>📊 MATCHED: <span style="color:var(--cyan)">${m.stock_name} (${m.stock_id})</span></span>
+      <span>📅 ${m.date_end}</span>
+      <span>🎯 SIM: ${((m.combined_sim||0)*100).toFixed(1)}%</span>
+      <span style="color:var(--text4)">MODEL: local-retrieval</span>
+    </div>` : "";
+
+  document.getElementById("chartai-result-panel").innerHTML = `
+    <div class="fadeIn">
+      <div class="chart-signal-header ${sigCls}">
+        <div>
+          <div style="font-family:var(--font-title);font-size:28px;color:${sigColor}">${sig}</div>
+          <div style="font-family:var(--font-mono);font-size:9px;color:${sigColor}">${conf}% CONFIDENCE</div>
+        </div>
+        <div class="conf-bar-wrap" style="flex:1;margin-left:16px">
+          <div class="conf-bar" style="width:${conf}%;background:${sigColor}"></div>
+        </div>
+      </div>
+      ${matchBadge}
+      <div class="chart-analysis-content" style="padding:4px">${html}</div>
+    </div>`;
+}
+
+// ── JOURNAL ────────────────────────────────────────────────────
+function prefillJournal(stockId, mkt, dir, entry, stop, tp1, tp2) {
+  document.getElementById("add-trade-form").classList.remove("hidden");
+  document.getElementById("jnl-market").value = mkt;
+  document.getElementById("jnl-stock").value  = stockId;
+  document.getElementById("jnl-dir").value    = dir;
+  document.getElementById("jnl-entry").value  = parseFloat(entry).toFixed(2);
+  document.getElementById("jnl-stop").value   = parseFloat(stop).toFixed(2);
+  document.getElementById("jnl-tp1").value    = parseFloat(tp1).toFixed(2);
+  document.getElementById("jnl-tp2").value    = parseFloat(tp2).toFixed(2);
+  // scroll to journal
+  document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.page==="journal"));
+  document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+  document.getElementById("page-journal").classList.add("active");
+  currentPage = "journal";
+}
+
+function addJournalTrade() {
+  const mkt   = document.getElementById("jnl-market").value;
+  const stock = document.getElementById("jnl-stock").value.trim().toUpperCase();
+  const dir   = document.getElementById("jnl-dir").value;
+  const entry = parseFloat(document.getElementById("jnl-entry").value);
+  const qty   = parseFloat(document.getElementById("jnl-qty").value);
+  const stop  = parseFloat(document.getElementById("jnl-stop").value);
+  const tp1   = parseFloat(document.getElementById("jnl-tp1").value);
+  const tp2   = parseFloat(document.getElementById("jnl-tp2").value);
+  const notes = document.getElementById("jnl-notes").value;
+
+  if (!stock || isNaN(entry) || isNaN(qty)) { alert("Fill in stock, entry and quantity."); return; }
+
+  trades.push({
+    id: Date.now(), mkt, stock, dir, entry, qty, stop, tp1, tp2, notes,
+    status: "OPEN", date: new Date().toISOString().slice(0,10), exitPrice: null, exitDate: null
+  });
+  saveTrades();
+  renderJournal();
+  document.getElementById("add-trade-form").classList.add("hidden");
+}
+
+function closeTrade(id) {
+  const trade = trades.find(t => t.id === id);
+  if (!trade) return;
+  const mkt = getMktData(trade.mkt);
+  const currentPrice = mkt[trade.stock]?.price || trade.entry;
+  trade.exitPrice = currentPrice;
+  trade.exitDate  = new Date().toISOString().slice(0,10);
+  trade.status    = "CLOSED";
+  saveTrades();
+  renderJournal();
+}
+
+function deleteTrade(id) {
+  trades = trades.filter(t => t.id !== id);
+  saveTrades();
+  renderJournal();
+}
+
+function saveTrades() { localStorage.setItem("sn_trades", JSON.stringify(trades)); }
+
+function calcPnL(t) {
+  const exitP = t.exitPrice || getMktData(t.mkt)[t.stock]?.price || t.entry;
+  const mult  = t.dir === "LONG" ? 1 : -1;
+  return round2((exitP - t.entry) * t.qty * mult);
+}
+function round2(v) { return Math.round(v * 100) / 100; }
+
+function renderJournal() {
+  const open   = trades.filter(t => t.status === "OPEN");
+  const closed = trades.filter(t => t.status === "CLOSED");
+
+  // Group P&L by market/currency
+  const usClosed  = closed.filter(t => t.mkt === "us");
+  const euClosed  = closed.filter(t => t.mkt === "eu");
+  const asClosed  = closed.filter(t => t.mkt === "as");
+  const usPnL  = usClosed.reduce((a,t) => a + calcPnL(t), 0);
+  const euPnL  = euClosed.reduce((a,t) => a + calcPnL(t), 0);
+  const asPnL  = asClosed.reduce((a,t) => a + calcPnL(t), 0);
+  const wins    = closed.filter(t => calcPnL(t) > 0).length;
+  const losses  = closed.filter(t => calcPnL(t) <= 0).length;
+  const winRate = closed.length ? round2(wins/closed.length*100) : 0;
+
+  const pnlDisplay = [
+    euClosed.length ? `<span style="color:${euPnL>=0?"var(--green)":"var(--red)"}">€${euPnL>=0?"+":""}${fpRaw(euPnL)} EU</span>` : "",
+    asClosed.length ? `<span style="color:${asPnL>=0?"var(--green)":"var(--red)"}">¥${asPnL>=0?"+":""}${fpRaw(asPnL)} ASIA</span>` : "",
+    usClosed.length ? `<span style="color:${usPnL>=0?"var(--green)":"var(--red)"}">$${usPnL>=0?"+":""}${fpRaw(usPnL)} US</span>` : "",
+  ].filter(Boolean).join(" · ") || "—";
+
+  document.getElementById("journal-stats").innerHTML = `
+    <div style="margin-bottom:4px;font-family:var(--font-mono);font-size:9px;color:var(--text3);letter-spacing:2px">PORTFOLIO SUMMARY</div>
+    <div class="jnl-stats-grid">
+      <div class="jnl-stat">
+        <div class="jnl-stat-label">REALISED P&L</div>
+        <div class="jnl-stat-val" style="font-size:11px">${pnlDisplay}</div>
+      </div>
+      <div class="jnl-stat">
+        <div class="jnl-stat-label">OPEN TRADES</div>
+        <div class="jnl-stat-val">${open.length}</div>
+      </div>
+      <div class="jnl-stat">
+        <div class="jnl-stat-label">CLOSED</div>
+        <div class="jnl-stat-val">${closed.length}</div>
+      </div>
+      <div class="jnl-stat">
+        <div class="jnl-stat-label">WIN RATE</div>
+        <div class="jnl-stat-val" style="color:${winRate>=50?"var(--green)":"var(--red)"}">${winRate}%</div>
+      </div>
+      <div class="jnl-stat">
+        <div class="jnl-stat-label">WINS</div>
+        <div class="jnl-stat-val" style="color:var(--green)">${wins}</div>
+      </div>
+      <div class="jnl-stat">
+        <div class="jnl-stat-label">LOSSES</div>
+        <div class="jnl-stat-val" style="color:var(--red)">${losses}</div>
+      </div>
+    </div>`;
+
+  const headerHtml = `
+    <div class="jnl-header">
+      <div>MKT</div><div>STOCK</div><div>DIR</div><div>ENTRY</div>
+      <div>CURRENT</div><div>P&L</div><div>QTY</div>
+      <div>SL</div><div>TP1</div><div>STATUS</div><div>ACTION</div>
+    </div>`;
+
+  const tradeRow = t => {
+    const mkt  = getMktData(t.mkt);
+    const cur  = t.exitPrice || mkt[t.stock]?.price || t.entry;
+    const pnl  = calcPnL(t);
+    const sym  = t.mkt==="eu"?"€":t.mkt==="as"?"¥":"$";
+    const flag = t.mkt==="eu"?"🌍":t.mkt==="as"?"🌏":"🇺🇸";
+    return `<div class="jnl-row">
+      <div style="font-size:9px">${flag}</div>
+      <div style="font-weight:700;color:var(--text)">${t.stock}</div>
+      <div style="color:${t.dir==="LONG"?"var(--green)":"var(--red)"}">${t.dir}</div>
+      <div>${sym}${fpRaw(t.entry)}</div>
+      <div style="color:${chColor(cur-t.entry)}">${sym}${fpRaw(cur)}</div>
+      <div style="color:${pnl>=0?"var(--green)":"var(--red);"}font-weight:700">${pnl>=0?"+":""}${fpRaw(pnl)}</div>
+      <div>${t.qty}</div>
+      <div style="color:var(--red)">${sym}${fpRaw(t.stop)}</div>
+      <div style="color:var(--green)">${sym}${fpRaw(t.tp1)}</div>
+      <div>${t.status==="OPEN"?`<span class="sig-badge sig-bull">OPEN</span>`:`<span class="sig-badge sig-neut">CLOSED</span>`}</div>
+      <div style="display:flex;gap:4px">
+        ${t.status==="OPEN"?`<button class="btn-secondary" style="padding:3px 7px;font-size:8px" onclick="closeTrade(${t.id})">CLOSE</button>`:""}
+        <button class="btn-secondary" style="padding:3px 7px;font-size:8px;color:var(--red)" onclick="deleteTrade(${t.id})">DEL</button>
+      </div>
+    </div>`;
+  };
+
+  document.getElementById("journal-open").innerHTML = open.length
+    ? headerHtml + open.map(tradeRow).join("")
+    : `<div style="font-family:var(--font-mono);font-size:10px;color:var(--text4);padding:20px;text-align:center">NO OPEN POSITIONS</div>`;
+
+  document.getElementById("journal-closed").innerHTML = closed.length
+    ? headerHtml + closed.map(tradeRow).join("")
+    : `<div style="font-family:var(--font-mono);font-size:10px;color:var(--text4);padding:20px;text-align:center">NO CLOSED TRADES</div>`;
+}
+
+function exportTrades() {
+  if (!trades.length) { alert("No trades to export."); return; }
+  const headers = ["Market","Stock","Direction","Entry","Exit","Qty","SL","TP1","Status","P&L","Date","Notes"];
+  const rows = trades.map(t => {
+    const pnl = calcPnL(t);
+    return [t.mkt,t.stock,t.dir,t.entry,t.exitPrice||"",t.qty,t.stop,t.tp1,t.status,pnl,t.date,t.notes||""];
+  });
+  const csv = [headers,...rows].map(r=>r.join(",")).join("\n");
+  const blob = new Blob([csv], {type:"text/csv"});
+  const url  = URL.createObjectURL(blob);
+  const a    = Object.assign(document.createElement("a"), {href:url,download:"stock_nexus_trades.csv"});
+  a.click(); URL.revokeObjectURL(url);
+}
