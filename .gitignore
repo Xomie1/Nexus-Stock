@@ -1,36 +1,41 @@
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
 .Python
 *.egg-info/
 dist/
 build/
-.eggs/
 
 # Environment
 .env
-*.env
+.env.local
+.env.*.local
+*.local
 
 # Virtual environments
 venv/
 env/
 .venv/
 
-# Model artifacts
-model/trained/*.pkl
-model/trained/*.h5
-model/trained/*.json
-model/chart_db.sqlite
-
-# Logs
-*.log
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
 
-# IDE
-.vscode/
-.idea/
+# Logs
+*.log
+logs/
+
+# SQLite databases (chart DB is generated, not committed)
+model/trained/chart_retrieval.db
+
+# Large model files — commit only if using Git LFS
+# model/trained/*.keras
+# model/trained/*.pkl
