@@ -1311,6 +1311,26 @@ def model_status():
     return jsonify({"ready": ready, "stats": stats})
 
 
+@app.route("/api/db_stats")
+def db_stats_route():
+    """Return Supabase connection status and accumulated data summary."""
+    try:
+        from database import get_data_summary, is_connected
+        return jsonify(get_data_summary())
+    except Exception as e:
+        return jsonify({"connected": False, "error": str(e)})
+
+
+@app.route("/api/training_status")
+def training_status_route():
+    """Return retraining scheduler state."""
+    try:
+        from retrain_scheduler import get_status
+        return jsonify(get_status())
+    except Exception as e:
+        return jsonify({"error": str(e), "running": False, "last_run": None})
+
+
 @app.route("/api/analyze_chart", methods=["POST"])
 def analyze_chart():
     """Analyze an uploaded chart image using the local retrieval model."""
