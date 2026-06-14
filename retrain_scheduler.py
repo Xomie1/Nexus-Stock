@@ -268,34 +268,34 @@ def run_retrain_background(trigger: str = "scheduled") -> threading.Thread:
 
 def start_scheduler():
     """
-    Start APScheduler for weekly retraining (Sunday 02:00 UTC).
+    Start APScheduler for retraining every 3 days at 02:00 UTC.
     Non-blocking — runs in a background thread pool.
     Returns the scheduler instance, or None if APScheduler is not installed.
     """
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
-        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
         import pytz
 
         scheduler = BackgroundScheduler(timezone=pytz.utc)
         scheduler.add_job(
-            lambda: run_retrain_background("weekly_scheduled"),
-            CronTrigger(day_of_week="sun", hour=2, minute=0),
-            id="weekly_retrain",
+            lambda: run_retrain_background("scheduled_3day"),
+            IntervalTrigger(days=3, hour=2, minute=0, timezone=pytz.utc),
+            id="retrain_3day",
             replace_existing=True,
             misfire_grace_time=3600,  # allow up to 1hr delay if server was restarting
         )
         scheduler.start()
 
-        job      = scheduler.get_job("weekly_retrain")
+        job      = scheduler.get_job("retrain_3day")
         next_run = str(job.next_run_time) if job else "unknown"
         _status["next_run"] = next_run
-        log.info(f"[SCHEDULER] ✅ Weekly retraining active — next run: {next_run}")
+        log.info(f"[SCHEDULER] ✅ Retraining every 3 days active — next run: {next_run}")
         return scheduler
 
     except ImportError:
         log.warning(
-            "[SCHEDULER] APScheduler not installed — weekly retraining disabled. "
+            "[SCHEDULER] APScheduler not installed — 3-day retraining disabled. "
             "Install: pip install apscheduler pytz"
         )
         return None
