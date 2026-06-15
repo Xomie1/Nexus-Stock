@@ -1331,6 +1331,67 @@ def training_status_route():
         return jsonify({"error": str(e), "running": False, "last_run": None})
 
 
+# ── Paper trading routes ───────────────────────────────────────────────────────
+
+@app.route("/api/paper_trades", methods=["GET"])
+def get_paper_trades_route():
+    try:
+        from database import get_paper_trades, is_connected
+        if not is_connected():
+            return jsonify({"ok": False, "reason": "db_offline", "trades": []})
+        return jsonify({"ok": True, "trades": get_paper_trades()})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e), "trades": []})
+
+
+@app.route("/api/paper_trades", methods=["POST"])
+def open_paper_trade_route():
+    """Log a new open paper trade."""
+    try:
+        from database import upsert_paper_trade, is_connected
+        if not is_connected():
+            return jsonify({"ok": False, "reason": "db_offline"}), 503
+        trade = request.get_json(force=True)
+        if not trade or not trade.get("id"):
+            return jsonify({"ok": False, "reason": "missing id"}), 400
+        upsert_paper_trade(_sanitize(trade))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
+
+@app.route("/api/paper_trades/<trade_id>/close", methods=["POST"])
+def close_paper_trade_route(trade_id):
+    """Close a paper trade (WIN or LOSS)."""
+    try:
+        from database import close_paper_trade, is_connected
+        if not is_connected():
+            return jsonify({"ok": False, "reason": "db_offline"}), 503
+        body = request.get_json(force=True) or {}
+        close_paper_trade(
+            trade_id,
+            body.get("result", "LOSS"),
+            float(body.get("exit_price", 0)),
+            body.get("exit_time", ""),
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
+
+@app.route("/api/paper_trades/reset", methods=["POST"])
+def reset_paper_trades_route():
+    """Wipe all paper trades."""
+    try:
+        from database import reset_paper_trades, is_connected
+        if not is_connected():
+            return jsonify({"ok": False, "reason": "db_offline"}), 503
+        reset_paper_trades()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "reason": str(e)}), 500
+
+
 @app.route("/api/analyze_chart", methods=["POST"])
 def analyze_chart():
     """Analyze an uploaded chart image using the local retrieval model."""

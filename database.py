@@ -153,5 +153,66 @@ def get_data_summary() -> dict:
         return {"connected": False, "error": str(e)}
 
 
+# ── Paper trades ──────────────────────────────────────────────────────────────
+
+def get_paper_trades() -> list:
+    """Return all paper trades, newest first."""
+    if not _ok or not _sb:
+        return []
+    try:
+        result = (
+            _sb.table("paper_trades")
+            .select("*")
+            .order("time", desc=True)
+            .limit(500)
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        log.error(f"[DB] get_paper_trades failed: {e}")
+        return []
+
+
+def upsert_paper_trade(trade: dict) -> bool:
+    """Insert or update a paper trade by its id."""
+    if not _ok or not _sb:
+        return False
+    try:
+        _sb.table("paper_trades").upsert(trade, on_conflict="id").execute()
+        return True
+    except Exception as e:
+        log.error(f"[DB] upsert_paper_trade failed: {e}")
+        return False
+
+
+def close_paper_trade(trade_id: str, result: str, exit_price: float, exit_time: str) -> bool:
+    """Mark a paper trade as closed."""
+    if not _ok or not _sb:
+        return False
+    try:
+        _sb.table("paper_trades").update({
+            "status":     "CLOSED",
+            "result":     result,
+            "exit_price": exit_price,
+            "exit_time":  exit_time,
+        }).eq("id", trade_id).execute()
+        return True
+    except Exception as e:
+        log.error(f"[DB] close_paper_trade failed: {e}")
+        return False
+
+
+def reset_paper_trades() -> bool:
+    """Delete all paper trades."""
+    if not _ok or not _sb:
+        return False
+    try:
+        _sb.table("paper_trades").delete().neq("id", "").execute()
+        return True
+    except Exception as e:
+        log.error(f"[DB] reset_paper_trades failed: {e}")
+        return False
+
+
 # Initialise on import
 init_db()

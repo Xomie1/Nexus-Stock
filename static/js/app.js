@@ -13,7 +13,8 @@ let euSectorFilter = "ALL";
 let usSectorFilter = "ALL";
 const CURR_SYMS = {"USD":"$","EUR":"€","GBP":"p","JPY":"¥","HKD":"HK$","INR":"₹","KRW":"₩","CHF":"Fr","DKK":"kr","SEK":"kr","NGN":"₦"};
 let trades      = JSON.parse(localStorage.getItem("sn_trades")  || "[]");
-let paperTrades = JSON.parse(localStorage.getItem("sn_paper")   || "[]");
+let paperTrades = [];   // loaded from server on init; localStorage is fallback only
+let _dbOnline   = false;
 
 // ── FORMAT HELPERS ─────────────────────────────────────────────
 function fp(v, currency = "USD") {
@@ -71,6 +72,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     renderPredSidebar();
     renderJournal();
     startSSE();
+
+    // Load paper trades from server (universal across devices)
+    await loadPaperTradesFromServer();
 
     // Morning brief on dashboard
     loadMorningBrief();
@@ -912,40 +916,98 @@ function renderAnalysisResult(d, balance, riskPct) {
   </div>`;
 }
 
-// ── AUTO PAPER TRADING ─────────────────────────────────
-function autoPaperTrade(results) {
+// ── PAPER TRADING — SERVER-BACKED ──────────────────────
+
+async function loadPaperTradesFromServer() {
+  try {
+    const res  = await fetch("/api/paper_trades");
+    const data = await res.json();
+    if (data.ok) {
+      _dbOnline   = true;
+      paperTrades = data.trades.map(normalisePaperTrade);
+      renderPaperStats();
+      updateJournalBadge();
+    } else {
+      // DB offline — fall back to localStorage
+      _dbOnline   = false;
+      paperTrades = JSON.parse(localStorage.getItem("sn_paper") || "[]");
+      renderPaperStats();
+    }
+  } catch(e) {
+    _dbOnline   = false;
+    paperTrades = JSON.parse(localStorage.getItem("sn_paper") || "[]");
+    renderPaperStats();
+  }
+}
+
+// Normalise snake_case keys from DB to camelCase used in UI
+function normalisePaperTrade(t) {
+  return {
+    id:        t.id,
+    ticker:    t.ticker || t.id.split("_")[0],
+    name:      t.name,
+    market:    t.market,
+    currency:  t.currency,
+    color:     t.color,
+    direction: t.direction,
+    conf:      t.conf,
+    entry:     parseFloat(t.entry),
+    stop:      parseFloat(t.stop),
+    tp1:       parseFloat(t.tp1),
+    tp2:       t.tp2 ? parseFloat(t.tp2) : null,
+    rr:        t.rr,
+    time:      t.time,
+    status:    t.status,
+    result:    t.result || null,
+    exitPrice: t.exit_price ? parseFloat(t.exit_price) : null,
+    exitTime:  t.exit_time  || null,
+  };
+}
+
+function updateJournalBadge() {
+  const jNav = document.querySelector('.nav-item[data-page="journal"]');
+  if (jNav) {
+    const open = paperTrades.filter(p => p.status === "OPEN").length;
+    jNav.querySelector("span:last-child").textContent = `TRADE ${open > 0 ? "(" + open + ")" : ""}`;
+  }
+}
+
+async function autoPaperTrade(results) {
   // Only auto-log strong signals (conf >= 65%) that have TP/SL data
   const strong = results.filter(r => r.conf >= 65 && r.t1 && r.stop);
   let added = 0;
   for (const r of strong) {
-    // Don't double-log the same stock if already open
-    if (paperTrades.find(p => p.id === r.id && p.status === "OPEN")) continue;
-    paperTrades.push({
-      id: r.id, name: r.name, market: r.market,
+    if (paperTrades.find(p => p.ticker === r.id && p.status === "OPEN")) continue;
+    const tradeTime = new Date().toISOString();
+    const trade = {
+      id: `${r.id}_${tradeTime}`, ticker: r.id, name: r.name, market: r.market,
       currency: r.currency, color: r.color,
       direction: r.direction, conf: r.conf,
       entry: r.price, stop: r.stop, tp1: r.t1, tp2: r.t2, rr: r.rr,
-      time: new Date().toISOString(),
-      status: "OPEN", result: null, exitPrice: null, exitTime: null,
-    });
+      time: tradeTime,
+      status: "OPEN", result: null, exit_price: null, exit_time: null,
+    };
+    if (_dbOnline) {
+      await fetch("/api/paper_trades", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(trade),
+      });
+    }
+    paperTrades.push(normalisePaperTrade(trade));
     added++;
   }
   if (added) {
-    localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
+    if (!_dbOnline) localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
     renderPaperStats();
-    // Update journal tab badge
-    const jNav = document.querySelector('.nav-item[data-page="journal"]');
-    if (jNav) {
-      const open = paperTrades.filter(p => p.status === "OPEN").length;
-      jNav.querySelector("span:last-child").textContent = `TRADE ${open > 0 ? "(" + open + ")" : ""}`;
-    }
+    updateJournalBadge();
   }
 }
 
-function checkPaperTrades(stockId, price) {
+async function checkPaperTrades(stockId, price) {
   let changed = false;
   for (const t of paperTrades) {
-    if (t.id !== stockId || t.status !== "OPEN") continue;
+    if (t.ticker !== stockId || t.status !== "OPEN") continue;
     const isLong = t.direction === "BULLISH";
     const hitTP  = isLong ? price >= t.tp1 : price <= t.tp1;
     const hitSL  = isLong ? price <= t.stop : price >= t.stop;
@@ -954,11 +1016,18 @@ function checkPaperTrades(stockId, price) {
       t.result    = hitTP ? "WIN" : "LOSS";
       t.exitPrice = hitTP ? t.tp1 : t.stop;
       t.exitTime  = new Date().toISOString();
+      if (_dbOnline) {
+        await fetch(`/api/paper_trades/${encodeURIComponent(t.id)}/close`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ result: t.result, exit_price: t.exitPrice, exit_time: t.exitTime }),
+        });
+      }
       changed = true;
     }
   }
   if (changed) {
-    localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
+    if (!_dbOnline) localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
     if (currentPage === "journal") renderPaperStats();
   }
 }
@@ -972,14 +1041,17 @@ function renderPaperStats() {
   const losses = closed.filter(t => t.result === "LOSS").length;
   const acc    = closed.length ? Math.round(wins / closed.length * 100) : null;
   const accColor = acc === null ? "var(--text3)" : acc >= 55 ? "var(--green)" : acc >= 45 ? "var(--amber)" : "var(--red)";
+  const dbBadge  = _dbOnline
+    ? `<span style="color:var(--green);font-size:8px;margin-left:8px">● SYNCED</span>`
+    : `<span style="color:var(--amber);font-size:8px;margin-left:8px">● LOCAL</span>`;
 
-  const rowHtml = (trades, showStatus) => trades.slice(0,8).map(t => {
+  const rowHtml = (trades, showStatus) => trades.slice(0, 8).map(t => {
     const sym = currSym(t.currency || "USD");
     const isLong = t.direction === "BULLISH";
     const dc = isLong ? "var(--green)" : "var(--red)";
     const flag = t.market==="eu"?"🌍":t.market==="as"?"🌏":"🇺🇸";
     const pnl = t.exitPrice ? ((isLong ? t.exitPrice - t.entry : t.entry - t.exitPrice) / t.entry * 100).toFixed(2) : null;
-    return `<div class="paper-row" onclick="quickSelect('${t.id}','${t.market}')">
+    return `<div class="paper-row" onclick="quickSelect('${t.ticker||t.id}','${t.market}')">
       <div style="color:var(--text2)">${new Date(t.time).toLocaleDateString("en",{month:"short",day:"numeric"})}</div>
       <div style="font-weight:700;color:${t.color||dc}">${flag} ${t.id}</div>
       <div style="color:${dc}">${isLong?"▲ LONG":"▼ SHORT"}</div>
@@ -995,7 +1067,7 @@ function renderPaperStats() {
 
   el.innerHTML = `
   <div class="section-title" style="margin-bottom:14px">
-    AUTO PAPER TRADING — ACCURACY TRACKER
+    AUTO PAPER TRADING — ACCURACY TRACKER ${dbBadge}
     <button class="btn-secondary" style="float:right;font-size:9px;padding:2px 8px" onclick="clearPaperTrades()">RESET</button>
   </div>
   <div style="font-family:var(--font-mono);font-size:9px;color:var(--text3);margin-bottom:12px">
@@ -1019,18 +1091,22 @@ function renderPaperStats() {
   <div class="paper-header paper-row">
     <span>DATE</span><span>STOCK</span><span>DIR</span><span>ENTRY</span><span>SL</span><span>TP1</span><span>R:R</span><span>RESULT</span>
   </div>
-  ${rowHtml(closed.reverse(), false)}` : ""}
+  ${rowHtml([...closed].reverse(), false)}` : ""}
   ${!open.length && !closed.length ? `
   <div class="empty-state" style="padding:24px 0">
     <div class="empty-sub">No paper trades yet.<br/>Auto-logs when a scan finds a signal ≥65% confidence.</div>
   </div>` : ""}`;
 }
 
-function clearPaperTrades() {
+async function clearPaperTrades() {
   if (!confirm("Reset all paper trade data?")) return;
+  if (_dbOnline) {
+    await fetch("/api/paper_trades/reset", { method: "POST" });
+  }
   paperTrades = [];
-  localStorage.setItem("sn_paper", JSON.stringify(paperTrades));
+  localStorage.removeItem("sn_paper");
   renderPaperStats();
+  updateJournalBadge();
 }
 
 // ── MORNING BRIEF ──────────────────────────────────────
