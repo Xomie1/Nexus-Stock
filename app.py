@@ -443,9 +443,13 @@ def _fetch_live_us_seeds():
     """Fetch current US prices from yfinance at startup to replace stale hardcoded seeds."""
     _fetch_yf_seeds(US_STOCKS, US_SEEDS, "US")
 
-_fetch_yf_seeds(EU_STOCKS, EU_SEEDS, "EU")
-_fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA")
-_fetch_live_us_seeds()
+# Run all three seed fetches in parallel — sequential calls take 60-120s and
+# trigger Render's 30s request timeout on cold starts.
+_t_eu   = threading.Thread(target=lambda: _fetch_yf_seeds(EU_STOCKS,   EU_SEEDS,   "EU"),   daemon=True)
+_t_as   = threading.Thread(target=lambda: _fetch_yf_seeds(ASIA_STOCKS, ASIA_SEEDS, "ASIA"), daemon=True)
+_t_us   = threading.Thread(target=_fetch_live_us_seeds, daemon=True)
+for _t in (_t_eu, _t_as, _t_us): _t.start()
+for _t in (_t_eu, _t_as, _t_us): _t.join(timeout=25)  # max 25s — continue with whatever loaded
 
 def _init_market(seeds, stocks, defaults):
     """Build market dict with open price stored for change% accumulation."""
@@ -614,6 +618,17 @@ def price_poll_thread():
 
 threading.Thread(target=price_poll_thread, daemon=True).start()
 
+# Background OHLCV prefetch — warms the cache for all 125 tickers in batches
+# so the first /api/analyze calls hit the cache instead of blocking yfinance.
+def _startup_prefetch():
+    all_tickers = (
+        [s["yf"] for s in EU_STOCKS   if s.get("yf")] +
+        [s["yf"] for s in ASIA_STOCKS if s.get("yf")] +
+        [s["yf"] for s in US_STOCKS   if s.get("yf")]
+    )
+    _batch_prefetch_ohlcv(all_tickers, period="120d", interval="1d", batch_size=30)
+threading.Thread(target=_startup_prefetch, daemon=True).start()
+
 # ── Technical indicator helpers ───────────────────────────────────────────────
 def _rsi(s, p=14):
     d = s.diff()
@@ -654,6 +669,53 @@ def _adx(h, l, c, p=14):
 
 _ohlcv_cache = {}
 _ohlcv_cache_ts = {}
+
+def _batch_prefetch_ohlcv(tickers: list, period="120d", interval="1d", batch_size=30):
+    """
+    Prefetch OHLCV for multiple tickers in batches of `batch_size` using a
+    single yf.download() call per batch. Results are stored in _ohlcv_cache
+    so subsequent fetch_ohlcv_stock() calls hit the cache instantly.
+    Called once at startup in a background thread — does not block the server.
+    """
+    if not _yf_ok:
+        return
+    now = time.time()
+    batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+    for batch in batches:
+        try:
+            raw = yf.download(
+                tickers=" ".join(batch),
+                period=period, interval=interval,
+                auto_adjust=True, progress=False,
+                threads=False, group_by="ticker",
+            )
+            if raw is None or raw.empty:
+                continue
+            # Single ticker returns flat columns; multi returns MultiIndex
+            is_multi = isinstance(raw.columns, pd.MultiIndex)
+            for ticker in batch:
+                try:
+                    if not is_multi:
+                        df = raw.copy()
+                    else:
+                        if ticker not in raw.columns.get_level_values(0):
+                            continue
+                        df = raw[ticker].copy()
+                    df.columns = [str(c).strip().title() for c in df.columns]
+                    if "Close" not in df.columns:
+                        continue
+                    df = df[["Open","High","Low","Close","Volume"]].dropna()
+                    if len(df) < 20:
+                        continue
+                    cache_key = f"{ticker}_{period}_{interval}"
+                    _ohlcv_cache[cache_key]    = df
+                    _ohlcv_cache_ts[cache_key] = now
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[BATCH OHLCV] batch failed: {e}")
+        time.sleep(1)  # 1s gap between batches to avoid rate limits
+    print(f"[BATCH OHLCV] Prefetched {len(_ohlcv_cache)} tickers into cache")
 
 def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
     if not _yf_ok or not ticker:
