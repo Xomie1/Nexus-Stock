@@ -1015,7 +1015,7 @@ async function checkPaperTrades(stockId, price) {
     const halfTP = isLong
       ? t.entry + (t.tp1 - t.entry) * 0.5
       : t.entry - (t.entry - t.tp1) * 0.5;
-    const hitHalf   = isLong ? price >= halfTP : price <= halfTP;
+    const hitHalf        = isLong ? price >= halfTP : price <= halfTP;
     const reversedThrough = isLong ? price <= t.entry : price >= t.entry;
     // Only trigger reversal exit if we previously reached halfway (track with t.reachedHalf)
     if (hitHalf && !t.reachedHalf) { t.reachedHalf = true; }
@@ -1023,8 +1023,7 @@ async function checkPaperTrades(stockId, price) {
     if (hitTP || hitSL || hitTrailSL) {
       t.status    = "CLOSED";
       t.result    = hitTP ? "WIN" : "LOSS";
-      if (hitTrailSL && !hitTP) t.result = "LOSS";
-      t.exitPrice = hitTP ? t.tp1 : t.stop;
+      t.exitPrice = hitTP ? t.tp1 : hitTrailSL ? t.entry : t.stop;
       t.exitTime  = new Date().toISOString();
       if (_dbOnline) {
         await fetch(`/api/paper_trades/${encodeURIComponent(t.id)}/close`, {

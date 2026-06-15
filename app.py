@@ -747,38 +747,46 @@ def compute_indicators(df):
         "vol_ratio": round(vol_r, 2), "candle": candle, "price": round(price, 2),
     }
 
+# ── Weekly trend cache ────────────────────────────────────────────────────────
+_weekly_cache = {}
+_weekly_cache_ts = {}
+
 def fetch_weekly_trend(ticker):
-    """Fetch 52-week weekly OHLCV and return trend direction based on EMA10/EMA20."""
-    import time as _time
-    now = _time.time()
+    """Fetch 52-week weekly OHLCV and return EMA10/EMA20 trend direction."""
+    now = time.time()
     if ticker in _weekly_cache and now - _weekly_cache_ts.get(ticker, 0) < 21600:
         return _weekly_cache[ticker]
     try:
-        df = yf.download(ticker, period="1y", interval="1wk", progress=False, auto_adjust=True)
+        df = yf.download(ticker, period="1y", interval="1wk",
+                         auto_adjust=True, progress=False, threads=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         if df is None or len(df) < 12:
             return None
-        close = df["Close"].squeeze()
-        ema10 = close.ewm(span=10, adjust=False).mean().iloc[-1]
-        ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+        close = df["Close"].dropna()
+        ema10 = float(close.ewm(span=10, adjust=False).mean().iloc[-1])
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
         # Weekly RSI
         delta = close.diff()
-        gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
-        rs = gain / loss if loss.iloc[-1] != 0 else pd.Series([100])
-        weekly_rsi = float(100 - (100 / (1 + rs.iloc[-1])))
-        # Trend
-        diff_pct = abs(ema10 - ema20) / ema20 * 100 if ema20 != 0 else 0
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        weekly_rsi = float(100 - 100 / (1 + rs.iloc[-1]))
+        # Trend direction
+        diff_pct = abs(ema10 - ema20) / (ema20 + 1e-9) * 100
         if diff_pct < 0.5:
             trend = "NEUTRAL"
         elif ema10 > ema20:
             trend = "UP"
         else:
             trend = "DOWN"
-        result = {"trend": trend, "ema10": float(ema10), "ema20": float(ema20), "weekly_rsi": weekly_rsi}
+        result = {"trend": trend, "ema10": round(ema10, 4),
+                  "ema20": round(ema20, 4), "weekly_rsi": round(weekly_rsi, 1)}
         _weekly_cache[ticker] = result
         _weekly_cache_ts[ticker] = now
         return result
-    except Exception:
+    except Exception as e:
+        print(f"[WEEKLY] {ticker}: {e}")
         return None
 
 def rule_based_signal(ind, ch):
@@ -836,9 +844,6 @@ def swing_levels(df):
 _news_cache = {}
 _news_cache_lock = threading.Lock()
 NEWS_TTL = 600
-
-_weekly_cache = {}
-_weekly_cache_ts = {}
 
 STOCK_KEYWORDS = {
     "beat":+2.5, "record":+2.0, "profit":+1.8, "revenue growth":+2.0, "upgrade":+2.0,
