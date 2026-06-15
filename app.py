@@ -618,16 +618,18 @@ def price_poll_thread():
 
 threading.Thread(target=price_poll_thread, daemon=True).start()
 
-# Background OHLCV prefetch — warms the cache for all 125 tickers in batches
-# so the first /api/analyze calls hit the cache instead of blocking yfinance.
-def _startup_prefetch():
+# Background OHLCV refresh loop — runs at startup then every 50 minutes so
+# the cache never expires under live user traffic (TTL is 60 min).
+def _ohlcv_refresh_loop():
     all_tickers = (
         [s["yf"] for s in EU_STOCKS   if s.get("yf")] +
         [s["yf"] for s in ASIA_STOCKS if s.get("yf")] +
         [s["yf"] for s in US_STOCKS   if s.get("yf")]
     )
-    _batch_prefetch_ohlcv(all_tickers, period="120d", interval="1d", batch_size=30)
-threading.Thread(target=_startup_prefetch, daemon=True).start()
+    while True:
+        _batch_prefetch_ohlcv(all_tickers, period="120d", interval="1d", batch_size=30)
+        time.sleep(50 * 60)   # 50 minutes — refresh before 60-min TTL expires
+threading.Thread(target=_ohlcv_refresh_loop, daemon=True).start()
 
 # ── Technical indicator helpers ───────────────────────────────────────────────
 def _rsi(s, p=14):
@@ -669,13 +671,14 @@ def _adx(h, l, c, p=14):
 
 _ohlcv_cache = {}
 _ohlcv_cache_ts = {}
+_ohlcv_cache_lock = threading.Lock()   # thread-safe writes from parallel startup threads
+_CACHE_TTL = 3600                       # 1-hour TTL
 
 def _batch_prefetch_ohlcv(tickers: list, period="120d", interval="1d", batch_size=30):
     """
-    Prefetch OHLCV for multiple tickers in batches of `batch_size` using a
-    single yf.download() call per batch. Results are stored in _ohlcv_cache
-    so subsequent fetch_ohlcv_stock() calls hit the cache instantly.
-    Called once at startup in a background thread — does not block the server.
+    Fetch OHLCV for multiple tickers in batches using a single yf.download()
+    call per batch. Writes are lock-protected. Called at startup and every
+    50 minutes to keep the cache warm before the 1-hour TTL expires.
     """
     if not _yf_ok:
         return
@@ -691,7 +694,6 @@ def _batch_prefetch_ohlcv(tickers: list, period="120d", interval="1d", batch_siz
             )
             if raw is None or raw.empty:
                 continue
-            # Single ticker returns flat columns; multi returns MultiIndex
             is_multi = isinstance(raw.columns, pd.MultiIndex)
             for ticker in batch:
                 try:
@@ -708,22 +710,50 @@ def _batch_prefetch_ohlcv(tickers: list, period="120d", interval="1d", batch_siz
                     if len(df) < 20:
                         continue
                     cache_key = f"{ticker}_{period}_{interval}"
-                    _ohlcv_cache[cache_key]    = df
-                    _ohlcv_cache_ts[cache_key] = now
+                    with _ohlcv_cache_lock:
+                        _ohlcv_cache[cache_key]    = df
+                        _ohlcv_cache_ts[cache_key] = now
                 except Exception:
                     pass
         except Exception as e:
             print(f"[BATCH OHLCV] batch failed: {e}")
-        time.sleep(1)  # 1s gap between batches to avoid rate limits
-    print(f"[BATCH OHLCV] Prefetched {len(_ohlcv_cache)} tickers into cache")
+        time.sleep(1)   # 1s gap between batches to stay Yahoo-friendly
+    print(f"[BATCH OHLCV] Cache warmed: {len(_ohlcv_cache)} tickers")
 
 def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
     if not _yf_ok or not ticker:
         return None
     cache_key = f"{ticker}_{period}_{interval}"
     now = time.time()
-    if cache_key in _ohlcv_cache and now - _ohlcv_cache_ts.get(cache_key, 0) < 3600:
-        return _ohlcv_cache[cache_key]
+    age = now - _ohlcv_cache_ts.get(cache_key, 0)
+
+    # ── Stale-while-revalidate ────────────────────────────────────────────────
+    # Return cached data immediately (even if stale) so the user never waits.
+    # Trigger a background refresh if the entry is older than TTL.
+    cached = _ohlcv_cache.get(cache_key)
+    if cached is not None and age >= _CACHE_TTL:
+        def _bg_refresh():
+            try:
+                df = yf.download(ticker, period=period, interval=interval,
+                                 auto_adjust=True, progress=False, threads=False)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df.columns = [str(c).strip().title() for c in df.columns]
+                if df.empty or "Close" not in df.columns: return
+                df = df[["Open","High","Low","Close","Volume"]].dropna()
+                if len(df) < 20: return
+                with _ohlcv_cache_lock:
+                    _ohlcv_cache[cache_key]    = df
+                    _ohlcv_cache_ts[cache_key] = time.time()
+            except Exception:
+                pass
+        threading.Thread(target=_bg_refresh, daemon=True).start()
+        return cached   # return stale data immediately — refresh happens in background
+
+    if cached is not None:
+        return cached   # fresh hit
+
+    # Cache miss — fetch synchronously (only happens before prefetch completes)
     try:
         df = yf.download(ticker, period=period, interval=interval,
                          auto_adjust=True, progress=False, threads=False)
@@ -735,8 +765,9 @@ def fetch_ohlcv_stock(ticker, period="120d", interval="1d"):
         df = df[["Open","High","Low","Close","Volume"]].dropna()
         if len(df) < 20:
             return None
-        _ohlcv_cache[cache_key] = df
-        _ohlcv_cache_ts[cache_key] = now
+        with _ohlcv_cache_lock:
+            _ohlcv_cache[cache_key]    = df
+            _ohlcv_cache_ts[cache_key] = time.time()
         return df
     except Exception as e:
         print(f"[OHLCV] {ticker}: {e}")
