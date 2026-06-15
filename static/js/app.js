@@ -714,8 +714,35 @@ function renderAnalysisResult(d, balance, riskPct) {
     </div>`;
   }
 
+  // ── Macro context bar ──────────────────────────────────────────────────────
+  const macro      = d.macro || {};
+  const regime     = macro.regime || "NEUTRAL";
+  const vix        = macro.vix != null ? parseFloat(macro.vix).toFixed(1) : "—";
+  const mktOpen    = macro.marketOpen;
+  const rrSpread   = d.prediction?.rrAfterSpread;
+  const regColor   = regime==="BULL" ? "var(--green)" : regime==="BEAR" ? "var(--red)" : "var(--amber)";
+  const vixColor   = parseFloat(vix)>25 ? "var(--red)" : parseFloat(vix)>18 ? "var(--amber)" : "var(--green)";
+  const macroBar   = `
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-family:var(--font-mono);font-size:9px">
+    <span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      MACRO <span style="color:${regColor};font-weight:700">${regime}</span>
+    </span>
+    <span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      VIX <span style="color:${vixColor};font-weight:700">${vix}</span>${macro.vixWideSL ? " · SL WIDENED" : ""}
+    </span>
+    ${rrSpread != null ? `<span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      R:R AFTER SPREAD <span style="color:var(--cyan);font-weight:700">${rrSpread}:1</span>
+    </span>` : ""}
+    <span style="background:var(--card2);padding:3px 8px;border-radius:4px">
+      ${mktOpen
+        ? `<span style="color:var(--green)">● MARKET OPEN</span>`
+        : `<span style="color:var(--text3)">● MARKET CLOSED</span>`}
+    </span>
+  </div>`;
+
   document.getElementById("pred-content").innerHTML = `
   <div class="fadeIn">
+    ${macroBar}
 
     <!-- TRADE BRIEF CARD — primary action signal -->
     ${renderTradeBrief(d.tradeBrief, sym, d.stockId, predMarket)}
@@ -983,7 +1010,8 @@ async function autoPaperTrade(results) {
       id: `${r.id}_${tradeTime}`, ticker: r.id, name: r.name, market: r.market,
       currency: r.currency, color: r.color,
       direction: r.direction, conf: r.conf,
-      entry: r.price, stop: r.stop, tp1: r.t1, tp2: r.t2, rr: r.rr,
+      entry: r.direction==="BULLISH" ? +(r.price*1.0015).toFixed(4) : +(r.price*0.9985).toFixed(4), // 0.15% spread
+      stop: r.stop, tp1: r.t1, tp2: r.t2, rr: r.rr,
       time: tradeTime,
       status: "OPEN", result: null, exit_price: null, exit_time: null,
     };

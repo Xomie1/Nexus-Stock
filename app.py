@@ -751,6 +751,58 @@ def compute_indicators(df):
 _weekly_cache = {}
 _weekly_cache_ts = {}
 
+# ── Macro regime + VIX cache (6-hour TTL) ────────────────────────────────────
+_macro_cache    = {}
+_macro_cache_ts = {}
+
+# Market hours in UTC (open_hour, close_hour) — for signal gating
+MARKET_HOURS_UTC = {
+    "eu": (7,  17),   # LSE / Euronext / XETRA
+    "as": (0,   9),   # TSE / HKEX morning sessions
+    "us": (14, 21),   # NYSE / NASDAQ
+}
+
+def _market_is_open(market_type: str) -> bool:
+    import datetime as _dt
+    now_h = _dt.datetime.utcnow().hour
+    lo, hi = MARKET_HOURS_UTC.get(market_type, (0, 24))
+    return lo <= now_h < hi
+
+_BENCHMARKS = {"eu": "VGK", "as": "AAXJ", "us": "SPY"}
+
+def fetch_macro_regime(market_type: str) -> dict:
+    """Benchmark vs 200-EMA regime + VIX. Cached 6 hours."""
+    now = time.time()
+    if market_type in _macro_cache and now - _macro_cache_ts.get(market_type, 0) < 21600:
+        return _macro_cache[market_type]
+    result = {"regime": "NEUTRAL", "vix": 18.0, "vix_wide_sl": False}
+    try:
+        bench = _BENCHMARKS.get(market_type, "SPY")
+        df_b  = yf.download(bench, period="1y", interval="1d",
+                            auto_adjust=True, progress=False, threads=False)
+        if df_b is not None and len(df_b) >= 50:
+            c      = df_b["Close"].squeeze()
+            ema200 = float(c.ewm(span=200, adjust=False).mean().iloc[-1])
+            last   = float(c.iloc[-1])
+            if last > ema200 * 1.005:
+                result["regime"] = "BULL"
+            elif last < ema200 * 0.995:
+                result["regime"] = "BEAR"
+    except Exception:
+        pass
+    try:
+        df_vix = yf.download("^VIX", period="5d", interval="1d",
+                             auto_adjust=True, progress=False, threads=False)
+        if df_vix is not None and len(df_vix) > 0:
+            vix = float(df_vix["Close"].squeeze().iloc[-1])
+            result["vix"]         = round(vix, 1)
+            result["vix_wide_sl"] = vix > 25
+    except Exception:
+        pass
+    _macro_cache[market_type]    = result
+    _macro_cache_ts[market_type] = now
+    return result
+
 def fetch_weekly_trend(ticker):
     """Fetch 52-week weekly OHLCV and return EMA10/EMA20 trend direction."""
     now = time.time()
@@ -1199,6 +1251,25 @@ def analyze():
                 weekly_boost = -12
             conf = max(10, min(95, conf + weekly_boost))
 
+        # ── Macro regime filter ───────────────────────────────────────────────
+        macro = {}
+        try:
+            macro = fetch_macro_regime(market_type)
+        except Exception:
+            pass
+        macro_regime  = macro.get("regime", "NEUTRAL")
+        vix           = macro.get("vix", 18.0)
+        vix_wide_sl   = macro.get("vix_wide_sl", False)
+        if macro_regime == "BEAR" and direction == "BULLISH":
+            conf = max(10, min(95, conf - 15))
+        elif macro_regime == "BULL" and direction == "BEARISH":
+            conf = max(10, min(95, conf - 10))
+        elif macro_regime == "BULL" and direction == "BULLISH":
+            conf = max(10, min(95, conf + 5))
+
+        # ── Market hours gate ─────────────────────────────────────────────────
+        market_open = _market_is_open(market_type)
+
         # TP/SL from swing levels or ATR
         atr_raw = indicators["atr_raw"]
         if df is not None and len(df) >= 20:
@@ -1242,6 +1313,31 @@ def analyze():
             stop = round(price*(1-m*1.2), 2)
 
         rr = round(abs(t1 - price) / (abs(price - stop) + 1e-6), 2)
+
+        # ── VIX: widen SL when market is fearful ─────────────────────────────
+        if vix_wide_sl and direction in ("BULLISH", "BEARISH"):
+            vix_extra = atr_raw * 0.5
+            if direction == "BULLISH":
+                stop = round(stop - vix_extra, 2)
+            else:
+                stop = round(stop + vix_extra, 2)
+            rr = round(abs(t1 - price) / (abs(price - stop) + 1e-6), 2)
+
+        # ── Spread/slippage simulation (0.30% round-trip — Trading 212) ──────
+        SPREAD_PCT = 0.003
+        if direction == "BULLISH":
+            eff_entry = price * (1 + SPREAD_PCT / 2)
+            eff_tp1   = t1   * (1 - SPREAD_PCT / 2)
+            eff_stop  = stop * (1 - SPREAD_PCT / 2)
+        elif direction == "BEARISH":
+            eff_entry = price * (1 - SPREAD_PCT / 2)
+            eff_tp1   = t1   * (1 + SPREAD_PCT / 2)
+            eff_stop  = stop * (1 + SPREAD_PCT / 2)
+        else:
+            eff_entry, eff_tp1, eff_stop = price, t1, stop
+        rr_after_spread = round(
+            abs(eff_tp1 - eff_entry) / (abs(eff_entry - eff_stop) + 1e-6), 2
+        )
 
         # News
         news_items = []
@@ -1296,13 +1392,14 @@ def analyze():
         trade_brief = _build_trade_brief(direction, conf, price, t1, t2, stop, rr,
                                          indicators, news_score, news_items, data_src)
 
-        # ── Record to signal history when tradeable ───────────────────────
-        if consensus.get("tradeable"):
+        # ── Record to signal history — only during market hours ──────────────
+        if consensus.get("tradeable") and market_open:
             with _signal_history_lock:
                 _signal_history.append({
                     "id": stock_id, "name": stock_info["name"],
                     "market": market_type, "direction": direction, "conf": conf,
                     "entry": price, "stop": stop, "tp1": t1, "tp2": t2, "rr": rr,
+                    "rrAfterSpread": rr_after_spread,
                     "time": time.strftime("%d %b %H:%M", time.gmtime()),
                 })
                 if len(_signal_history) > 100:
@@ -1313,9 +1410,16 @@ def analyze():
             "stockInfo": stock_info,
             "price": price, "change": change,
             "indicators": indicators,
+            "macro": {
+                "regime":    macro_regime,
+                "vix":       vix,
+                "vixWideSL": vix_wide_sl,
+                "marketOpen": market_open,
+            },
             "prediction": {
                 "dir": direction, "bullPct": bp, "bearPct": 100-bp,
-                "conf": conf, "targets": {"t1":t1,"t2":t2,"stop":stop}, "rr": rr,
+                "conf": conf, "targets": {"t1":t1,"t2":t2,"stop":stop},
+                "rr": rr, "rrAfterSpread": rr_after_spread,
             },
             "mlPrediction": ml_pred,
             "consensus": consensus,
