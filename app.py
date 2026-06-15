@@ -747,6 +747,40 @@ def compute_indicators(df):
         "vol_ratio": round(vol_r, 2), "candle": candle, "price": round(price, 2),
     }
 
+def fetch_weekly_trend(ticker):
+    """Fetch 52-week weekly OHLCV and return trend direction based on EMA10/EMA20."""
+    import time as _time
+    now = _time.time()
+    if ticker in _weekly_cache and now - _weekly_cache_ts.get(ticker, 0) < 21600:
+        return _weekly_cache[ticker]
+    try:
+        df = yf.download(ticker, period="1y", interval="1wk", progress=False, auto_adjust=True)
+        if df is None or len(df) < 12:
+            return None
+        close = df["Close"].squeeze()
+        ema10 = close.ewm(span=10, adjust=False).mean().iloc[-1]
+        ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+        # Weekly RSI
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+        rs = gain / loss if loss.iloc[-1] != 0 else pd.Series([100])
+        weekly_rsi = float(100 - (100 / (1 + rs.iloc[-1])))
+        # Trend
+        diff_pct = abs(ema10 - ema20) / ema20 * 100 if ema20 != 0 else 0
+        if diff_pct < 0.5:
+            trend = "NEUTRAL"
+        elif ema10 > ema20:
+            trend = "UP"
+        else:
+            trend = "DOWN"
+        result = {"trend": trend, "ema10": float(ema10), "ema20": float(ema20), "weekly_rsi": weekly_rsi}
+        _weekly_cache[ticker] = result
+        _weekly_cache_ts[ticker] = now
+        return result
+    except Exception:
+        return None
+
 def rule_based_signal(ind, ch):
     b = br = 0
     rsi = ind["rsi"]; macd = ind["macd"]; bb = ind["bb_pct"]
@@ -769,6 +803,19 @@ def rule_based_signal(ind, ch):
     conf = round(min(88, max(20, abs(bp - 50) * 2.2)))
     if adx < 18 and direction != "NEUTRAL" and conf < 55:
         direction = "NEUTRAL"; conf = round(conf * 0.6)
+    # Mean reversion filter — penalise signals that chase extended moves
+    ema50 = ind.get("ema50", 0)
+    price_ = ind.get("price", 0)
+    atr_pct = ind.get("atr", 0)
+    if ema50 > 0 and atr_pct > 0 and price_ > 0:
+        deviation_pct = (price_ - ema50) / ema50 * 100
+        atr_threshold = atr_pct * 2  # 2× ATR from EMA50 = extended
+        if direction == "BULLISH" and deviation_pct > atr_threshold:
+            # Price too far above EMA50 — reduce bull confidence
+            conf = round(conf * 0.80)
+        elif direction == "BEARISH" and deviation_pct < -atr_threshold:
+            # Price too far below EMA50 — reduce bear confidence (may bounce)
+            conf = round(conf * 0.80)
     return direction, conf, bp
 
 def swing_levels(df):
@@ -789,6 +836,9 @@ def swing_levels(df):
 _news_cache = {}
 _news_cache_lock = threading.Lock()
 NEWS_TTL = 600
+
+_weekly_cache = {}
+_weekly_cache_ts = {}
 
 STOCK_KEYWORDS = {
     "beat":+2.5, "record":+2.0, "profit":+1.8, "revenue growth":+2.0, "upgrade":+2.0,
@@ -837,7 +887,7 @@ def fetch_stock_news(stock_id, stock_name):
         _news_cache[key] = {"items": items[:6], "ts": now}
     return items[:6]
 
-def score_news(items):
+def score_news(items, vol_ratio=1.0):
     if not items: return 0.0, 0.5
     total = 0.0
     for item in items:
@@ -846,7 +896,8 @@ def score_news(items):
         item["score"] = round(score, 2)
         total += score
     avg = total / len(items)
-    bull = min(1.0, max(0.0, 0.5 + avg / 10))
+    vol_mult = min(2.0, vol_ratio * 0.7) if vol_ratio > 1.5 else 1.0
+    bull = min(1.0, max(0.0, 0.5 + avg * vol_mult / 10))
     return round(avg, 2), round(bull, 3)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1123,6 +1174,26 @@ def analyze():
 
         direction, conf, bp = rule_based_signal(indicators, change)
 
+        # ── Multi-timeframe confirmation ─────────────────────────────────────
+        weekly = None
+        weekly_boost = 0
+        try:
+            weekly = fetch_weekly_trend(_yf)
+        except Exception:
+            pass
+        if weekly:
+            wtrd = weekly.get("trend")
+            # Boost conf when weekly and daily align; penalise when they conflict
+            if wtrd == "UP" and direction == "BULLISH":
+                weekly_boost = +8
+            elif wtrd == "DOWN" and direction == "BEARISH":
+                weekly_boost = +8
+            elif wtrd == "UP" and direction == "BEARISH":
+                weekly_boost = -12
+            elif wtrd == "DOWN" and direction == "BULLISH":
+                weekly_boost = -12
+            conf = max(10, min(95, conf + weekly_boost))
+
         # TP/SL from swing levels or ATR
         atr_raw = indicators["atr_raw"]
         if df is not None and len(df) >= 20:
@@ -1171,7 +1242,7 @@ def analyze():
         news_items = []
         try: news_items = fetch_stock_news(stock_id, stock_info["name"])
         except: pass
-        news_score, news_bull = score_news(news_items)
+        news_score, news_bull = score_news(news_items, indicators.get("vol_ratio", 1.0))
 
         # Trend label
         adx = indicators["adx"]

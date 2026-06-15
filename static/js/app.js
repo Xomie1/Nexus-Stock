@@ -1011,9 +1011,19 @@ async function checkPaperTrades(stockId, price) {
     const isLong = t.direction === "BULLISH";
     const hitTP  = isLong ? price >= t.tp1 : price <= t.tp1;
     const hitSL  = isLong ? price <= t.stop : price >= t.stop;
-    if (hitTP || hitSL) {
+    // Trailing: if price pulled back through entry after reaching 50% of TP1 distance
+    const halfTP = isLong
+      ? t.entry + (t.tp1 - t.entry) * 0.5
+      : t.entry - (t.entry - t.tp1) * 0.5;
+    const hitHalf   = isLong ? price >= halfTP : price <= halfTP;
+    const reversedThrough = isLong ? price <= t.entry : price >= t.entry;
+    // Only trigger reversal exit if we previously reached halfway (track with t.reachedHalf)
+    if (hitHalf && !t.reachedHalf) { t.reachedHalf = true; }
+    const hitTrailSL = t.reachedHalf && reversedThrough;
+    if (hitTP || hitSL || hitTrailSL) {
       t.status    = "CLOSED";
       t.result    = hitTP ? "WIN" : "LOSS";
+      if (hitTrailSL && !hitTP) t.result = "LOSS";
       t.exitPrice = hitTP ? t.tp1 : t.stop;
       t.exitTime  = new Date().toISOString();
       if (_dbOnline) {
