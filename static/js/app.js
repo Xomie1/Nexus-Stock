@@ -1005,6 +1005,10 @@ async function autoPaperTrade(results) {
   let added = 0;
   for (const r of strong) {
     if (paperTrades.find(p => p.ticker === r.id && p.status === "OPEN")) continue;
+    // Direction compliance guard — reject inverted TP1/SL before logging
+    const isLong = r.direction === "BULLISH";
+    if (isLong  && (r.t1 <= r.price || r.stop >= r.price)) continue;
+    if (!isLong && (r.t1 >= r.price || r.stop <= r.price)) continue;
     const tradeTime = new Date().toISOString();
     const trade = {
       id: `${r.id}_${tradeTime}`, ticker: r.id, name: r.name, market: r.market,
@@ -1090,7 +1094,7 @@ function renderPaperStats() {
     const pnl = t.exitPrice ? ((isLong ? t.exitPrice - t.entry : t.entry - t.exitPrice) / t.entry * 100).toFixed(2) : null;
     return `<div class="paper-row" onclick="quickSelect('${t.ticker||t.id}','${t.market}')">
       <div style="color:var(--text2)">${new Date(t.time).toLocaleDateString("en",{month:"short",day:"numeric"})}</div>
-      <div style="font-weight:700;color:${t.color||dc}">${flag} ${t.id}</div>
+      <div style="font-weight:700;color:${t.color||dc}">${flag} ${t.ticker||t.id.split('_')[0]}</div>
       <div style="color:${dc}">${isLong?"▲ LONG":"▼ SHORT"}</div>
       <div style="font-family:var(--font-mono);font-size:9px">${sym}${fpRaw(t.entry)}</div>
       <div style="font-family:var(--font-mono);font-size:9px;color:var(--red)">${sym}${fpRaw(t.stop)}</div>

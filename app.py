@@ -1382,8 +1382,10 @@ def analyze():
         m = atr_raw / price
         if direction == "BULLISH":
             t1   = round(nearest_above(1.0) or price*(1+m*1.5), 2)
+            # Ensure TP1 is actually above price
+            if t1 <= price:
+                t1 = round(price * (1 + m * 1.5), 2)
             t2   = round(nearest_above(2.0) or price*(1+m*3.0), 2)
-            # Ensure T2 is always further above price than T1
             if t2 <= t1:
                 t2 = round(t1 + atr_raw * 1.5, 2)
             stop = round((nearest_below(0.8) or price*(1-m*1.0)) * 0.9985, 2)
@@ -1392,8 +1394,10 @@ def analyze():
                 stop = round(price * (1 - m * 1.0), 2)
         elif direction == "BEARISH":
             t1   = round(nearest_below(1.0) or price*(1-m*1.5), 2)
+            # Ensure TP1 is actually below price
+            if t1 >= price:
+                t1 = round(price * (1 - m * 1.5), 2)
             t2   = round(nearest_below(2.0) or price*(1-m*3.0), 2)
-            # Ensure T2 is always further below price than T1
             if t2 >= t1:
                 t2 = round(t1 - atr_raw * 1.5, 2)
             stop = round((nearest_above(0.8) or price*(1+m*1.0)) * 1.0015, 2)
